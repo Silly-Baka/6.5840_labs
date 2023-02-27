@@ -308,7 +308,7 @@ text {
         const nClient = maxClient + 1
 
         // Prepare some useful data to be used later:
-        // - Add a GID to each event
+        // - Offer a GID to each event
         // - Create a mapping from GIDs back to events
         // - Create a set of all timestamps
         // - Create a set of all start timestamps

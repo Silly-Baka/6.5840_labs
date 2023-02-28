@@ -3,6 +3,7 @@ package mr
 import (
 	"fmt"
 	"log"
+	"sync"
 	"time"
 )
 import "net"
@@ -13,7 +14,7 @@ import "net/http"
 type Coordinator struct {
 	// Your definitions here.
 
-	TaskNum int
+	NMap int
 	// the most num of reduce task
 	NReduce int
 
@@ -24,14 +25,19 @@ type Coordinator struct {
 	//ReduceWorkers []string
 	//// word to worker's socketName
 	//WorkerMap map[string]string
+	FreeMapTaskQueue    Queue
+	FreeReduceTaskQueue Queue
+	FinishedMapTask     map[int]bool
+	FinishedReduceTask  map[int]bool
 
-	TaskList          []Task
-	FreeTaskQueue     Queue
-	FinishedTaskQueue Queue
+	IHash2KeyMap map[int][]string
+	Key2FileMap  map[string][]string
 }
 type Task struct {
 	Number        int
-	InputFileName string
+	Type          int // 0-Map, 1-Reduce
+	InputFileName []string
+	Key2FileMap   map[string][]string
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -44,22 +50,105 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error {
-	// todo 这里的pop操作要考虑加锁
-	data := c.FreeTaskQueue.Pop()
-	if data == nil {
-		return fmt.Errorf("there is no free task")
-	}
-	task, ok := data.(Task)
-	if !ok {
-		return fmt.Errorf("task %v error", data)
-	}
-	// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
-	time.AfterFunc(10*time.Second, func() {
-		c.FreeTaskQueue.Offer(task)
-	})
+var InitReduce sync.Once
 
+// get map task and reduce task ( when all map tasks have been finished  )
+func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error {
+
+	var task Task
+
+	// there are still unfinished map tasks
+	if len(c.FinishedMapTask) < c.NMap {
+		// return map task
+		// todo 这里的pop操作要考虑加锁
+		data := c.FreeMapTaskQueue.Pop()
+		if data == nil {
+			return fmt.Errorf("there is no free task")
+		}
+		task, ok := data.(Task)
+		if !ok {
+			return fmt.Errorf("task %v error", data)
+		}
+		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
+		time.AfterFunc(10*time.Second, func() {
+			c.FreeMapTaskQueue.Offer(task)
+		})
+	} else {
+		// return reduce task
+
+		// initialize reduce task, only once
+		InitReduce.Do(func() {
+			for reduceNum, keys := range c.IHash2KeyMap {
+				km := make(map[string][]string)
+				for _, key := range keys {
+					if km[key] == nil {
+						km[key] = make([]string, 0)
+					}
+					km[key] = append(km[key], c.Key2FileMap[key]...)
+				}
+				newTask := Task{
+					Number:      reduceNum,
+					Type:        ReduceTaskType,
+					Key2FileMap: km,
+				}
+				c.FreeReduceTaskQueue.Offer(newTask)
+			}
+		})
+		// get a free reduce task and return
+		data := c.FreeReduceTaskQueue.Pop()
+		if data == nil {
+			return fmt.Errorf("there is no free task")
+		}
+		task, ok := data.(Task)
+		if !ok {
+			return fmt.Errorf("task %v error", data)
+		}
+		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
+		time.AfterFunc(10*time.Second, func() {
+			c.FreeReduceTaskQueue.Offer(task)
+		})
+	}
 	resp.task = task
+	resp.nReduce = c.NReduce
+
+	return nil
+}
+
+var lock sync.Mutex
+
+func (c *Coordinator) FinishMap(req *FinishMapRequest, resp *FinishMapResponse) error {
+	// record Finished task
+	c.FinishedMapTask[req.TaskNum] = true
+	// add key-filename into map
+	for k, v := range *req.Key2FileMap {
+		// todo 需要考虑线程安全
+		if c.Key2FileMap[k] == nil {
+			if lock.TryLock() {
+				if c.Key2FileMap[k] == nil {
+					c.Key2FileMap[k] = make([]string, 0)
+				}
+				lock.Unlock()
+			}
+		}
+		c.Key2FileMap[k] = append(c.Key2FileMap[k], v)
+	}
+	// add hash-key into map
+	for hash, keys := range *req.IHash2KeyMap {
+		if c.IHash2KeyMap[hash] == nil {
+			if lock.TryLock() {
+				if c.IHash2KeyMap[hash] == nil {
+					c.IHash2KeyMap[hash] = make([]string, 0)
+				}
+				lock.Unlock()
+			}
+		}
+		c.IHash2KeyMap[hash] = append(c.IHash2KeyMap[hash], keys...)
+	}
+	return nil
+}
+
+func (c *Coordinator) FinishReduce(req *FinishReduceRequest, resp *FinishReduceResponse) error {
+	c.FinishedReduceTask[req.TaskNum] = true
 	return nil
 }
 
@@ -94,20 +183,20 @@ func (c *Coordinator) Done() bool {
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	l := len(files)
 	c := Coordinator{
-		TaskNum:           l,
-		NReduce:           nReduce,
-		TaskList:          make([]Task, l),
-		FreeTaskQueue:     Queue{},
-		FinishedTaskQueue: Queue{},
+		NMap:                l,
+		NReduce:             nReduce,
+		FreeMapTaskQueue:    Queue{},
+		FreeReduceTaskQueue: Queue{},
+		FinishedMapTask:     make(map[int]bool),
+		FinishedReduceTask:  make(map[int]bool),
 	}
 	// Your code here.
 	for n, file := range files {
 		task := Task{
 			Number:        n,
-			InputFileName: file,
+			InputFileName: []string{file},
 		}
-		c.TaskList[n] = task
-		c.FreeTaskQueue.Offer(task)
+		c.FreeMapTaskQueue.Offer(task)
 	}
 
 	c.server()

@@ -28,7 +28,24 @@ type GetTaskRequest struct {
 }
 
 type GetTaskResponse struct {
-	task Task
+	task    Task
+	nReduce int
+}
+
+type FinishMapRequest struct {
+	TaskNum      int
+	Key2FileMap  *map[string]string
+	IHash2KeyMap *map[int][]string
+}
+
+type FinishMapResponse struct {
+}
+
+type FinishReduceRequest struct {
+	TaskNum int
+}
+
+type FinishReduceResponse struct {
 }
 
 // Cook up a unique-ish UNIX-domain socket name

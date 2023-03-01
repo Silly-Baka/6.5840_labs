@@ -28,8 +28,8 @@ type GetTaskRequest struct {
 }
 
 type GetTaskResponse struct {
-	task    Task
-	nReduce int
+	Task    Task
+	NReduce int
 }
 
 type FinishMapRequest struct {

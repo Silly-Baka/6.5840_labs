@@ -15,7 +15,7 @@ type Coordinator struct {
 	// Your definitions here.
 
 	NMap int
-	// the most num of reduce task
+	// the most num of reduce Task
 	NReduce int
 
 	//// list of map workers ，can be changed to ip address , now use socketname
@@ -52,31 +52,31 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 
 var InitReduce sync.Once
 
-// get map task and reduce task ( when all map tasks have been finished  )
+// get map Task and reduce Task ( when all map tasks have been finished  )
 func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error {
 
 	var task Task
 
 	// there are still unfinished map tasks
 	if len(c.FinishedMapTask) < c.NMap {
-		// return map task
+		// return map Task
 		// todo 这里的pop操作要考虑加锁
 		data := c.FreeMapTaskQueue.Pop()
 		if data == nil {
-			return fmt.Errorf("there is no free task")
+			return fmt.Errorf("there is no free Task")
 		}
 		task, ok := data.(Task)
 		if !ok {
-			return fmt.Errorf("task %v error", data)
+			return fmt.Errorf("Task %v error", data)
 		}
 		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
 		time.AfterFunc(10*time.Second, func() {
 			c.FreeMapTaskQueue.Offer(task)
 		})
 	} else {
-		// return reduce task
+		// return reduce Task
 
-		// initialize reduce task, only once
+		// initialize reduce Task, only once
 		InitReduce.Do(func() {
 			for reduceNum, keys := range c.IHash2KeyMap {
 				km := make(map[string][]string)
@@ -94,22 +94,22 @@ func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error 
 				c.FreeReduceTaskQueue.Offer(newTask)
 			}
 		})
-		// get a free reduce task and return
+		// get a free reduce Task and return
 		data := c.FreeReduceTaskQueue.Pop()
 		if data == nil {
-			return fmt.Errorf("there is no free task")
+			return fmt.Errorf("there is no free Task")
 		}
 		task, ok := data.(Task)
 		if !ok {
-			return fmt.Errorf("task %v error", data)
+			return fmt.Errorf("Task %v error", data)
 		}
 		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
 		time.AfterFunc(10*time.Second, func() {
 			c.FreeReduceTaskQueue.Offer(task)
 		})
 	}
-	resp.task = task
-	resp.nReduce = c.NReduce
+	resp.Task = task
+	resp.NReduce = c.NReduce
 
 	return nil
 }
@@ -117,7 +117,7 @@ func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error 
 var lock sync.Mutex
 
 func (c *Coordinator) FinishMap(req *FinishMapRequest, resp *FinishMapResponse) error {
-	// record Finished task
+	// record Finished Task
 	c.FinishedMapTask[req.TaskNum] = true
 	// add key-filename into map
 	for k, v := range *req.Key2FileMap {
@@ -179,7 +179,7 @@ func (c *Coordinator) Done() bool {
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
+// NReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	l := len(files)
 	c := Coordinator{

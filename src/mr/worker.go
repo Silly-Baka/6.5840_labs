@@ -27,14 +27,14 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
-// task number for each KeyValue emitted by Map.
+// Task number for each KeyValue emitted by Map.
 func ihash(key string) int {
 	h := fnv.New32a()
 	h.Write([]byte(key))
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// actual logic of the map task
+// actual logic of the map Task
 func MapTask(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 	content, err := os.ReadFile(task.InputFileName[0])
 	if err != nil {
@@ -82,7 +82,7 @@ func MapTask(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 		&FinishMapResponse{})
 }
 
-var lock sync.Mutex
+var reduceLock sync.Mutex
 
 func ReduceTask(reducef func(string, []string) string, task *Task) {
 	ofname := "mr-out-" + string(task.Number)
@@ -113,12 +113,12 @@ func ReduceTask(reducef func(string, []string) string, task *Task) {
 					key := kv.Key
 					vs := kvs[key]
 					if vs == nil {
-						if lock.TryLock() {
+						if reduceLock.TryLock() {
 							vs = kvs[key]
 							if vs == nil {
 								vs = make([]string, 0)
 							}
-							lock.Unlock()
+							reduceLock.Unlock()
 						}
 					}
 					vs = append(vs, kv.Value)
@@ -190,17 +190,17 @@ func CallExample() {
 	}
 }
 
-// return task and nReduce
+// return Task and NReduce
 func GetTask() (*Task, int) {
 	req := GetTaskRequest{}
 	resp := GetTaskResponse{}
 
 	ok := call("Coordinator.GetTask", &req, &resp)
 	if !ok {
-		fmt.Printf("get task failed,the reason is: %v", ok)
+		fmt.Printf("get Task failed,the reason is: %v", ok)
 		return nil, 0
 	}
-	return &resp.task, resp.nReduce
+	return &resp.Task, resp.NReduce
 }
 
 // send an RPC request to the coordinator, wait for the response.

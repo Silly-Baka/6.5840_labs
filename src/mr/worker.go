@@ -3,14 +3,14 @@ package mr
 import (
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
 	"os"
 	"sort"
 	"sync"
 	"time"
 )
-import "log"
-import "net/rpc"
-import "hash/fnv"
 
 // Map functions return a slice of KeyValue.
 type KeyValue struct {
@@ -82,7 +82,7 @@ func MapTask(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 		&FinishMapResponse{})
 }
 
-var lock sync.Mutex
+var reduceLock sync.Mutex
 
 func ReduceTask(reducef func(string, []string) string, task *Task) {
 	ofname := "mr-out-" + string(task.Number)
@@ -113,12 +113,12 @@ func ReduceTask(reducef func(string, []string) string, task *Task) {
 					key := kv.Key
 					vs := kvs[key]
 					if vs == nil {
-						if lock.TryLock() {
+						if reduceLock.TryLock() {
 							vs = kvs[key]
 							if vs == nil {
 								vs = make([]string, 0)
 							}
-							lock.Unlock()
+							reduceLock.Unlock()
 						}
 					}
 					vs = append(vs, kv.Value)

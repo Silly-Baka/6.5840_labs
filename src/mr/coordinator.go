@@ -3,13 +3,13 @@ package mr
 import (
 	"fmt"
 	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
 	"sync"
 	"time"
 )
-import "net"
-import "os"
-import "net/rpc"
-import "net/http"
 
 type Coordinator struct {
 	// Your definitions here.
@@ -36,7 +36,7 @@ type Coordinator struct {
 type Task struct {
 	Number        int
 	Type          int // 0-Map, 1-Reduce
-	InputFileName []string
+	InputFileName string
 	Key2FileMap   map[string][]string
 }
 
@@ -55,8 +55,6 @@ var InitReduce sync.Once
 // get map Task and reduce Task ( when all map tasks have been finished  )
 func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error {
 
-	var task Task
-
 	// there are still unfinished map tasks
 	if len(c.FinishedMapTask) < c.NMap {
 		// return map Task
@@ -71,9 +69,12 @@ func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error 
 		}
 		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
 		time.AfterFunc(10*time.Second, func() {
-			c.FreeMapTaskQueue.Offer(task)
+			if !c.FinishedMapTask[task.Number] {
+				c.FreeMapTaskQueue.Offer(task)
+			}
 		})
-	} else {
+		resp.Task = &task
+	} else if len(c.FinishedReduceTask) < c.NReduce {
 		// return reduce Task
 
 		// initialize reduce Task, only once
@@ -105,10 +106,16 @@ func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error 
 		}
 		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
 		time.AfterFunc(10*time.Second, func() {
-			c.FreeReduceTaskQueue.Offer(task)
+			if !c.FinishedReduceTask[task.Number] {
+				c.FreeReduceTaskQueue.Offer(task)
+			}
 		})
+		resp.Task = &task
+
+	} else {
+		// all tasks are finished
+		resp.IsFinished = true
 	}
-	resp.Task = task
 	resp.NReduce = c.NReduce
 
 	return nil
@@ -174,6 +181,12 @@ func (c *Coordinator) Done() bool {
 
 	// Your code here.
 
+	// close coordinator when all task were finished
+	if len(c.FinishedMapTask) == c.NMap && len(c.FinishedReduceTask) == c.NReduce {
+		log.Fatal("all tasks are finished, coordinator will be closed")
+		ret = true
+	}
+
 	return ret
 }
 
@@ -181,6 +194,8 @@ func (c *Coordinator) Done() bool {
 // main/mrcoordinator.go calls this function.
 // NReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
+
+	fmt.Printf("inilitializing coordinator, the files are : %v", files)
 	l := len(files)
 	c := Coordinator{
 		NMap:                l,
@@ -194,7 +209,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	for n, file := range files {
 		task := Task{
 			Number:        n,
-			InputFileName: []string{file},
+			InputFileName: file,
 		}
 		c.FreeMapTaskQueue.Offer(task)
 	}

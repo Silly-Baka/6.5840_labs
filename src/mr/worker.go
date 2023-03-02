@@ -36,9 +36,9 @@ func ihash(key string) int {
 
 // actual logic of the map Task
 func MapTask(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
-	content, err := os.ReadFile(task.InputFileName[0])
+	content, err := os.ReadFile(task.InputFileName)
 	if err != nil {
-		log.Fatalf("read file %v error", task.InputFileName)
+		log.Fatalf("read file %s error", task.InputFileName)
 		return
 	}
 	kva := mapf("", string(content))
@@ -134,6 +134,7 @@ func ReduceTask(reducef func(string, []string) string, task *Task) {
 		fmt.Fprintf(ofile, "%v %v\n", k, output)
 	}
 	// send finish message to master
+	call("Coordinator.FinishReduce", &FinishReduceRequest{TaskNum: task.Number}, &FinishReduceResponse{})
 
 	// this is the correct format for each line of Reduce output.
 	//fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
@@ -148,7 +149,14 @@ func Worker(mapf func(string, string) []KeyValue,
 	// uncomment to send the Example RPC to the coordinator.
 	// CallExample()
 	for {
-		task, nReduce := GetTask()
+		task, nReduce, isFinished := GetTask()
+
+		// job finished, close this worker
+		if isFinished {
+			return
+		}
+
+		log.Fatalf("the task infomation is : %v", task)
 		if task != nil {
 			switch task.Type {
 			case MapTaskType:
@@ -191,16 +199,16 @@ func CallExample() {
 }
 
 // return Task and NReduce
-func GetTask() (*Task, int) {
-	req := GetTaskRequest{}
-	resp := GetTaskResponse{}
+func GetTask() (*Task, int, bool) {
+	var req GetTaskRequest
+	var resp GetTaskResponse
 
 	ok := call("Coordinator.GetTask", &req, &resp)
 	if !ok {
 		fmt.Printf("get Task failed,the reason is: %v", ok)
-		return nil, 0
+		return nil, 0, false
 	}
-	return &resp.Task, resp.NReduce
+	return resp.Task, resp.NReduce, resp.IsFinished
 }
 
 // send an RPC request to the coordinator, wait for the response.

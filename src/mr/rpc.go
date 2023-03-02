@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -28,8 +30,9 @@ type GetTaskRequest struct {
 }
 
 type GetTaskResponse struct {
-	Task    Task
-	NReduce int
+	Task       *Task
+	NReduce    int
+	IsFinished bool
 }
 
 type FinishMapRequest struct {

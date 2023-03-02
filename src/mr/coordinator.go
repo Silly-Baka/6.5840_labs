@@ -126,6 +126,8 @@ var lock sync.Mutex
 func (c *Coordinator) FinishMap(req *FinishMapRequest, resp *FinishMapResponse) error {
 	// record Finished Task
 	c.FinishedMapTask[req.TaskNum] = true
+
+	log.Fatal("the num of finished map is %v", len(c.FinishedMapTask))
 	// add key-filename into map
 	for k, v := range *req.Key2FileMap {
 		// todo 需要考虑线程安全
@@ -163,7 +165,7 @@ func (c *Coordinator) FinishReduce(req *FinishReduceRequest, resp *FinishReduceR
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
+	//l, e := net.Listen("tcp", ":8888")
 	sockname := coordinatorSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)

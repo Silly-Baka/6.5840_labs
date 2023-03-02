@@ -8,6 +8,7 @@ import (
 	"net/rpc"
 	"os"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -35,10 +36,12 @@ func ihash(key string) int {
 }
 
 // actual logic of the map Task
-func MapTask(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
+func DoMap(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
+
+	fmt.Printf("doing map task : %v \n", task)
 	content, err := os.ReadFile(task.InputFileName)
 	if err != nil {
-		log.Fatalf("read file %s error", task.InputFileName)
+		fmt.Printf("read file %s error\n", task.InputFileName)
 		return
 	}
 	kva := mapf("", string(content))
@@ -60,56 +63,75 @@ func MapTask(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 			// create new intermediate file and output result
 			curKey = kv.Key
 			hash := ihash(curKey) % nReduce
-			filename := "mr-" + string(task.Number) + "-" + string(hash)
+			filename := "mr-" + strconv.Itoa(task.Number) + "-" + strconv.Itoa(hash)
 			// record while file the key in
 			Key2FileMap[curKey] = filename
+			if IHash2KeyMap[hash] == nil {
+				// todo
+				IHash2KeyMap[hash] = make([]string, 0)
+			}
 			IHash2KeyMap[hash] = append(IHash2KeyMap[hash], curKey)
 			// close preFile
 			curFile.Close()
 			curFile, err = os.Create(filename)
 			// resource leak will not happen
-			enc = json.NewEncoder(curFile)
 			if err != nil {
-				log.Fatalf("failed to open the file %v", filename)
+				fmt.Printf("failed to open the file %v\n", filename)
 				return
 			}
+			enc = json.NewEncoder(curFile)
 		}
 		enc.Encode(&kv)
 	}
 	// send finish message to master
-	call("Coordinator.FinishMap",
+	ok := call("Coordinator.FinishMap",
 		&FinishMapRequest{task.Number, &Key2FileMap, &IHash2KeyMap},
 		&FinishMapResponse{})
+	if !ok {
+		fmt.Println("failed to finish map")
+		return
+	}
 }
 
 var reduceLock sync.Mutex
 
-func ReduceTask(reducef func(string, []string) string, task *Task) {
-	ofname := "mr-out-" + string(task.Number)
+func DoReduce(reducef func(string, []string) string, task *Task) {
+
+	log.Printf("doing reduce task : %v\n ", task)
+	ofname := "mr-out-" + strconv.Itoa(task.Number)
 
 	ofile, err := os.Create(ofname)
 	if err != nil {
 		// todo fault-talerance
-		log.Fatalf("failed to create result file [%v]", ofname)
+		fmt.Printf("failed to create result file [%v]\n", ofname)
 		return
 	}
 	defer ofile.Close()
 
 	// shuffle each key from intermediate file
 	kvs := make(map[string][]string)
+
+	fileFlag := make(map[string]bool)
+
 	// todo key2filemap中的key是冗余，
 	for _, intermediate := range task.Key2FileMap {
 		// read each intermediate file, and reduce the result
 		for _, ifname := range intermediate {
+			if fileFlag[ifname] {
+				continue
+			}
 			ifile, err := os.Open(ifname)
+			// record the checked file
+			fileFlag[ifname] = true
+
 			if err != nil {
-				log.Fatalf("failed to open the intermediate file [%v]", ifname)
+				fmt.Printf("failed to open the intermediate file [%v]\n", ifname)
 				return
 			}
 			dec := json.NewDecoder(ifile)
 			for {
 				var kv KeyValue
-				if err := dec.Decode(&kv); err != nil {
+				if err := dec.Decode(&kv); err == nil {
 					key := kv.Key
 					vs := kvs[key]
 					if vs == nil {
@@ -123,6 +145,8 @@ func ReduceTask(reducef func(string, []string) string, task *Task) {
 					}
 					vs = append(vs, kv.Value)
 					kvs[key] = vs
+				} else {
+					break
 				}
 			}
 			ifile.Close()
@@ -134,7 +158,10 @@ func ReduceTask(reducef func(string, []string) string, task *Task) {
 		fmt.Fprintf(ofile, "%v %v\n", k, output)
 	}
 	// send finish message to master
-	call("Coordinator.FinishReduce", &FinishReduceRequest{TaskNum: task.Number}, &FinishReduceResponse{})
+	ok := call("Coordinator.FinishReduce", &FinishReduceRequest{TaskNum: task.Number}, &FinishReduceResponse{})
+	if !ok {
+		log.Fatal("failed to finish reduce")
+	}
 
 	// this is the correct format for each line of Reduce output.
 	//fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
@@ -153,16 +180,17 @@ func Worker(mapf func(string, string) []KeyValue,
 
 		// job finished, close this worker
 		if isFinished {
+			fmt.Println("all job finished, worker closing")
 			return
 		}
 
-		log.Fatalf("the task infomation is : %v", task)
+		fmt.Printf("the task infomation is : %v\n", task)
 		if task != nil {
 			switch task.Type {
 			case MapTaskType:
-				MapTask(mapf, task, nReduce)
+				DoMap(mapf, task, nReduce)
 			case ReduceTaskType:
-				ReduceTask(reducef, task)
+				DoReduce(reducef, task)
 			}
 		} else {
 			time.Sleep(1 * time.Second)
@@ -215,7 +243,7 @@ func GetTask() (*Task, int, bool) {
 // usually returns true.
 // returns false if something goes wrong.
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	//c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":8888")
 	sockname := coordinatorSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {

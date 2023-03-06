@@ -9,8 +9,10 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // Map functions return a slice of KeyValue.
@@ -35,16 +37,21 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+var mapLock sync.Mutex
+
 // actual logic of the map Task
 func DoMap(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 
-	fmt.Printf("doing map task : %v \n", task)
+	//fmt.Printf("doing map task : %v \n", task.Number)
 	content, err := os.ReadFile(task.InputFileName)
 	if err != nil {
 		fmt.Printf("read file %s error\n", task.InputFileName)
-		return
+		//return
 	}
-	kva := mapf("", string(content))
+	// todo 修改回去
+	kva := mapf(task.InputFileName, string(content))
+	//kva := Map("", string(content))
+
 	intermediate := []KeyValue{}
 
 	intermediate = append(intermediate, kva...)
@@ -66,22 +73,35 @@ func DoMap(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 			filename := "mr-" + strconv.Itoa(task.Number) + "-" + strconv.Itoa(hash)
 			// record while file the key in
 			Key2FileMap[curKey] = filename
+
 			if IHash2KeyMap[hash] == nil {
 				// todo
-				IHash2KeyMap[hash] = make([]string, 0)
+				if mapLock.TryLock() {
+					if IHash2KeyMap[hash] == nil {
+						IHash2KeyMap[hash] = make([]string, 0)
+					}
+					mapLock.Unlock()
+				}
 			}
 			IHash2KeyMap[hash] = append(IHash2KeyMap[hash], curKey)
 			// close preFile
 			curFile.Close()
-			curFile, err = os.Create(filename)
-			// resource leak will not happen
+			curFile, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND, 0666)
 			if err != nil {
-				fmt.Printf("failed to open the file %v\n", filename)
-				return
+				_, err = os.Create(filename)
+				if err != nil {
+					log.Fatalf("create file %v error", filename)
+					return
+				}
+				curFile, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND, 0666)
+				if err != nil {
+					log.Fatalf("failed to open the file %v ", filename)
+					return
+				}
 			}
 			enc = json.NewEncoder(curFile)
 		}
-		enc.Encode(&kv)
+		enc.Encode(kv)
 	}
 	// send finish message to master
 	ok := call("Coordinator.FinishMap",
@@ -97,14 +117,22 @@ var reduceLock sync.Mutex
 
 func DoReduce(reducef func(string, []string) string, task *Task) {
 
-	log.Printf("doing reduce task : %v\n ", task)
+	//log.Printf("doing reduce task : %v\n ", task.Number)
 	ofname := "mr-out-" + strconv.Itoa(task.Number)
 
-	ofile, err := os.Create(ofname)
+	var ofile *os.File
+	ofile, err := os.OpenFile(ofname, os.O_WRONLY|os.O_APPEND, 0666)
 	if err != nil {
-		// todo fault-talerance
-		fmt.Printf("failed to create result file [%v]\n", ofname)
-		return
+		_, err = os.Create(ofname)
+		if err != nil {
+			log.Fatalf("create file %v error", ofname)
+			return
+		}
+		ofile, err = os.OpenFile(ofname, os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			log.Fatalf("failed to open the file %v ", ofname)
+			return
+		}
 	}
 	defer ofile.Close()
 
@@ -154,7 +182,9 @@ func DoReduce(reducef func(string, []string) string, task *Task) {
 	}
 	// reduce output
 	for k, vs := range kvs {
+		// todo 修改回去
 		output := reducef(k, vs)
+		//output := Reduce(k, vs)
 		fmt.Fprintf(ofile, "%v %v\n", k, output)
 	}
 	// send finish message to master
@@ -184,7 +214,6 @@ func Worker(mapf func(string, string) []KeyValue,
 			return
 		}
 
-		fmt.Printf("the task infomation is : %v\n", task)
 		if task != nil {
 			switch task.Type {
 			case MapTaskType:
@@ -192,8 +221,9 @@ func Worker(mapf func(string, string) []KeyValue,
 			case ReduceTaskType:
 				DoReduce(reducef, task)
 			}
+			//fmt.Printf("the task is %v:%v \n", task.Number, task.Type)
 		} else {
-			time.Sleep(1 * time.Second)
+			time.Sleep(2 * time.Second)
 		}
 	}
 
@@ -233,7 +263,7 @@ func GetTask() (*Task, int, bool) {
 
 	ok := call("Coordinator.GetTask", &req, &resp)
 	if !ok {
-		fmt.Printf("get Task failed,the reason is: %v", ok)
+		//fmt.Println("failed to get task")
 		return nil, 0, false
 	}
 	return resp.Task, resp.NReduce, resp.IsFinished
@@ -258,4 +288,23 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	fmt.Println(err)
 	return false
+}
+
+func Map(filename string, contents string) []KeyValue {
+	// function to detect word separators.
+	ff := func(r rune) bool { return !unicode.IsLetter(r) }
+
+	// split contents into an array of words.
+	words := strings.FieldsFunc(contents, ff)
+
+	kva := []KeyValue{}
+	for _, w := range words {
+		kv := KeyValue{w, "1"}
+		kva = append(kva, kv)
+	}
+	return kva
+}
+func Reduce(key string, values []string) string {
+	// return the number of occurrences of this word.
+	return strconv.Itoa(len(values))
 }

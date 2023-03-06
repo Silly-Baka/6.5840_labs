@@ -9,10 +9,12 @@ package main
 // Please do not change this file.
 //
 
-import "6.5840/mr"
+import (
+	"6.5840/mr"
+	"fmt"
+	"os"
+)
 import "time"
-import "os"
-import "fmt"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -21,6 +23,7 @@ func main() {
 	}
 
 	m := mr.MakeCoordinator(os.Args[1:], 10)
+	//m := mr.MakeCoordinator([]string{"../pg-being_ernest.txt"}, 10)
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}

@@ -10,10 +10,15 @@ package main
 // Please do not change this file.
 //
 
-import "6.5840/mr"
+import (
+	"6.5840/mr"
+	"fmt"
+	"os"
+)
 import "plugin"
-import "os"
-import "fmt"
+
+//import "os"
+//import "fmt"
 import "log"
 
 func main() {
@@ -23,8 +28,8 @@ func main() {
 	}
 
 	mapf, reducef := loadPlugin(os.Args[1])
-
 	mr.Worker(mapf, reducef)
+	//mr.Worker(nil, nil)
 }
 
 // load the application Map and Reduce functions

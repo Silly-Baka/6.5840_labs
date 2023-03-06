@@ -56,67 +56,78 @@ var InitReduce sync.Once
 func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error {
 
 	// there are still unfinished map tasks
-	if len(c.FinishedMapTask) < c.NMap {
-		// return map Task
-		// todo 这里的pop操作要考虑加锁
-		data := c.FreeMapTaskQueue.Pop()
-		if data == nil {
-			return fmt.Errorf("there is no free Task")
-		}
-		task, ok := data.(Task)
-		if !ok {
-			return fmt.Errorf("Task %v error", data)
-		}
-		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
-		time.AfterFunc(10*time.Second, func() {
-			if !c.FinishedMapTask[task.Number] {
-				c.FreeMapTaskQueue.Offer(task)
-			}
-		})
-		resp.Task = &task
-	} else if len(c.FinishedReduceTask) < c.NReduce {
-		// return reduce Task
-
-		// initialize reduce Task, only once
-		InitReduce.Do(func() {
-			for reduceNum, keys := range c.IHash2KeyMap {
-				km := make(map[string][]string)
-				for _, key := range keys {
-					if km[key] == nil {
-						km[key] = make([]string, 0)
+	for {
+		if lock.TryLock() {
+			if len(c.FinishedMapTask) < c.NMap {
+				// return map Task
+				// todo 这里的pop操作要考虑加锁
+				data := c.FreeMapTaskQueue.Pop()
+				if data == nil {
+					//return fmt.Errorf("there is no free Task")
+					return nil
+				}
+				task, ok := data.(Task)
+				if !ok {
+					return fmt.Errorf("Task %v error", data)
+				}
+				// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
+				time.AfterFunc(10*time.Second, func() {
+					if !c.FinishedMapTask[task.Number] {
+						c.FreeMapTaskQueue.Offer(task)
 					}
-					km[key] = append(km[key], c.Key2FileMap[key]...)
-				}
-				newTask := Task{
-					Number:      reduceNum,
-					Type:        ReduceTaskType,
-					Key2FileMap: km,
-				}
-				c.FreeReduceTaskQueue.Offer(newTask)
-			}
-		})
-		// get a free reduce Task and return
-		data := c.FreeReduceTaskQueue.Pop()
-		if data == nil {
-			return fmt.Errorf("there is no free Task")
-		}
-		task, ok := data.(Task)
-		if !ok {
-			return fmt.Errorf("Task %v error", data)
-		}
-		// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
-		time.AfterFunc(10*time.Second, func() {
-			if !c.FinishedReduceTask[task.Number] {
-				c.FreeReduceTaskQueue.Offer(task)
-			}
-		})
-		resp.Task = &task
+				})
+				resp.Task = &task
+				resp.IsFinished = false
+			} else if len(c.FinishedReduceTask) < c.NReduce {
+				// return reduce Task
 
-	} else {
-		// all tasks are finished
-		resp.IsFinished = true
+				// initialize reduce Task, only once
+				InitReduce.Do(func() {
+					for reduceNum, keys := range c.IHash2KeyMap {
+						km := make(map[string][]string)
+						for _, key := range keys {
+							if km[key] == nil {
+								km[key] = make([]string, 0)
+							}
+							km[key] = append(km[key], c.Key2FileMap[key]...)
+						}
+						newTask := Task{
+							Number:      reduceNum,
+							Type:        ReduceTaskType,
+							Key2FileMap: km,
+						}
+						c.FreeReduceTaskQueue.Offer(newTask)
+					}
+				})
+				// get a free reduce Task and return
+				data := c.FreeReduceTaskQueue.Pop()
+				if data == nil {
+					//return fmt.Errorf("there is no free Task")
+					return nil
+				}
+				task, ok := data.(Task)
+				if !ok {
+					return fmt.Errorf("Task %v error", data)
+				}
+				// 发出任务后，启动一个10s的计时器，到期就将该任务重新放回队列，便于获取
+				time.AfterFunc(10*time.Second, func() {
+					if !c.FinishedReduceTask[task.Number] {
+						c.FreeReduceTaskQueue.Offer(task)
+					}
+				})
+				resp.Task = &task
+				resp.IsFinished = false
+
+			} else {
+				// all tasks are finished
+				resp.IsFinished = true
+			}
+			resp.NReduce = c.NReduce
+
+			lock.Unlock()
+			break
+		}
 	}
-	resp.NReduce = c.NReduce
 
 	return nil
 }
@@ -125,12 +136,13 @@ var lock sync.Mutex
 
 func (c *Coordinator) FinishMap(req *FinishMapRequest, resp *FinishMapResponse) error {
 	// record Finished Task
-	c.FinishedMapTask[req.TaskNum] = true
-
-	log.Fatal("the num of finished map is %v", len(c.FinishedMapTask))
+	if lock.TryLock() {
+		c.FinishedMapTask[req.TaskNum] = true
+		lock.Unlock()
+	}
+	//fmt.Printf("the num of finished map is %v \n", len(c.FinishedMapTask))
 	// add key-filename into map
 	for k, v := range *req.Key2FileMap {
-		// todo 需要考虑线程安全
 		if c.Key2FileMap[k] == nil {
 			if lock.TryLock() {
 				if c.Key2FileMap[k] == nil {
@@ -157,7 +169,10 @@ func (c *Coordinator) FinishMap(req *FinishMapRequest, resp *FinishMapResponse) 
 }
 
 func (c *Coordinator) FinishReduce(req *FinishReduceRequest, resp *FinishReduceResponse) error {
-	c.FinishedReduceTask[req.TaskNum] = true
+	if lock.TryLock() {
+		c.FinishedReduceTask[req.TaskNum] = true
+		lock.Unlock()
+	}
 	return nil
 }
 
@@ -197,7 +212,7 @@ func (c *Coordinator) Done() bool {
 // NReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
-	fmt.Printf("inilitializing coordinator, the files are : %v", files)
+	//fmt.Printf("inilitializing coordinator, the files are : %v", files)
 	l := len(files)
 	c := Coordinator{
 		NMap:                l,
@@ -206,6 +221,8 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		FreeReduceTaskQueue: Queue{},
 		FinishedMapTask:     make(map[int]bool),
 		FinishedReduceTask:  make(map[int]bool),
+		IHash2KeyMap:        make(map[int][]string),
+		Key2FileMap:         make(map[string][]string),
 	}
 	// Your code here.
 	for n, file := range files {

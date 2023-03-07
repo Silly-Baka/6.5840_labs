@@ -43,13 +43,14 @@ var mapLock sync.Mutex
 func DoMap(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 
 	//fmt.Printf("doing map task : %v \n", task.Number)
-	content, err := os.ReadFile(task.InputFileName)
+	fname := task.InputFileName[0]
+	content, err := os.ReadFile(fname)
 	if err != nil {
 		fmt.Printf("read file %s error\n", task.InputFileName)
-		//return
+		return
 	}
 	// todo 修改回去
-	kva := mapf(task.InputFileName, string(content))
+	kva := mapf(fname, string(content))
 	//kva := Map("", string(content))
 
 	intermediate := []KeyValue{}
@@ -63,49 +64,49 @@ func DoMap(mapf func(string, string) []KeyValue, task *Task, nReduce int) {
 	var curFile *os.File
 	var enc *json.Encoder
 
-	Key2FileMap := make(map[string]string)
-	IHash2KeyMap := make(map[int][]string)
+	Hash2FileMap := make(map[int][]string)
 	for _, kv := range intermediate {
 		if kv.Key != curKey {
 			// create new intermediate file and output result
 			curKey = kv.Key
 			hash := ihash(curKey) % nReduce
 			filename := "mr-" + strconv.Itoa(task.Number) + "-" + strconv.Itoa(hash)
-			// record while file the key in
-			Key2FileMap[curKey] = filename
 
-			if IHash2KeyMap[hash] == nil {
-				// todo
-				if mapLock.TryLock() {
-					if IHash2KeyMap[hash] == nil {
-						IHash2KeyMap[hash] = make([]string, 0)
-					}
-					mapLock.Unlock()
-				}
-			}
-			IHash2KeyMap[hash] = append(IHash2KeyMap[hash], curKey)
 			// close preFile
 			curFile.Close()
 			curFile, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND, 0666)
-			if err != nil {
+			if err == os.ErrNotExist {
 				_, err = os.Create(filename)
 				if err != nil {
-					log.Fatalf("create file %v error", filename)
+					fmt.Printf("create file %v error\n", filename)
 					return
 				}
 				curFile, err = os.OpenFile(filename, os.O_WRONLY|os.O_APPEND, 0666)
 				if err != nil {
-					log.Fatalf("failed to open the file %v ", filename)
+					fmt.Printf("failed to open the file %v \n", filename)
 					return
 				}
 			}
 			enc = json.NewEncoder(curFile)
+
+			// record the pair of hash-file
+			if Hash2FileMap[hash] == nil {
+				// todo
+				mapLock.Lock()
+				if Hash2FileMap[hash] == nil {
+					Hash2FileMap[hash] = make([]string, 0)
+				}
+				mapLock.Unlock()
+			}
+			mapLock.Lock()
+			Hash2FileMap[hash] = append(Hash2FileMap[hash], filename)
+			mapLock.Unlock()
 		}
 		enc.Encode(kv)
 	}
 	// send finish message to master
 	ok := call("Coordinator.FinishMap",
-		&FinishMapRequest{task.Number, &Key2FileMap, &IHash2KeyMap},
+		&FinishMapRequest{task.Number, &Hash2FileMap},
 		&FinishMapResponse{})
 	if !ok {
 		fmt.Println("failed to finish map")
@@ -117,24 +118,7 @@ var reduceLock sync.Mutex
 
 func DoReduce(reducef func(string, []string) string, task *Task) {
 
-	//log.Printf("doing reduce task : %v\n ", task.Number)
-	ofname := "mr-out-" + strconv.Itoa(task.Number)
-
-	var ofile *os.File
-	ofile, err := os.OpenFile(ofname, os.O_WRONLY|os.O_APPEND, 0666)
-	if err != nil {
-		_, err = os.Create(ofname)
-		if err != nil {
-			log.Fatalf("create file %v error", ofname)
-			return
-		}
-		ofile, err = os.OpenFile(ofname, os.O_WRONLY|os.O_APPEND, 0666)
-		if err != nil {
-			log.Fatalf("failed to open the file %v ", ofname)
-			return
-		}
-	}
-	defer ofile.Close()
+	fmt.Printf("doing reduce task : %v\n ", task.Number)
 
 	// shuffle each key from intermediate file
 	kvs := make(map[string][]string)
@@ -142,55 +126,72 @@ func DoReduce(reducef func(string, []string) string, task *Task) {
 	fileFlag := make(map[string]bool)
 
 	// todo key2filemap中的key是冗余，
-	for _, intermediate := range task.Key2FileMap {
+	for _, ifname := range task.InputFileName {
 		// read each intermediate file, and reduce the result
-		for _, ifname := range intermediate {
-			if fileFlag[ifname] {
-				continue
-			}
-			ifile, err := os.Open(ifname)
-			// record the checked file
-			fileFlag[ifname] = true
-
-			if err != nil {
-				fmt.Printf("failed to open the intermediate file [%v]\n", ifname)
-				return
-			}
-			dec := json.NewDecoder(ifile)
-			for {
-				var kv KeyValue
-				if err := dec.Decode(&kv); err == nil {
-					key := kv.Key
-					vs := kvs[key]
-					if vs == nil {
-						if reduceLock.TryLock() {
-							vs = kvs[key]
-							if vs == nil {
-								vs = make([]string, 0)
-							}
-							reduceLock.Unlock()
-						}
-					}
-					vs = append(vs, kv.Value)
-					kvs[key] = vs
-				} else {
-					break
-				}
-			}
-			ifile.Close()
+		if fileFlag[ifname] {
+			continue
 		}
+		ifile, err := os.Open(ifname)
+		// record the checked file
+		fileFlag[ifname] = true
+
+		if err != nil {
+			fmt.Printf("failed to open the intermediate file [%v]\n", ifname)
+			return
+		}
+		dec := json.NewDecoder(ifile)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err == nil {
+				key := kv.Key
+				vs := kvs[key]
+				if vs == nil {
+					if reduceLock.TryLock() {
+						vs = kvs[key]
+						if vs == nil {
+							vs = make([]string, 0)
+						}
+						reduceLock.Unlock()
+					}
+				}
+				vs = append(vs, kv.Value)
+				kvs[key] = vs
+			} else {
+				break
+			}
+		}
+		ifile.Close()
 	}
+
+	dir, _ := os.Getwd()
+	tmpFile, err := os.CreateTemp(dir, "mr-tmp-*")
+
+	if err != nil {
+		//log.Fatal("failed to create temp file")
+		fmt.Println("failed to create temp file")
+	}
+	defer tmpFile.Close()
+
 	// reduce output
 	for k, vs := range kvs {
 		// todo 修改回去
 		output := reducef(k, vs)
 		//output := Reduce(k, vs)
-		fmt.Fprintf(ofile, "%v %v\n", k, output)
+		fmt.Fprintf(tmpFile, "%v %v\n", k, output)
 	}
+
+	ofname := "mr-out-" + strconv.Itoa(task.Number)
+	err = os.Rename(tmpFile.Name(), ofname)
+	if err != nil {
+		//log.Fatal(err)
+		fmt.Println("rename file error")
+	}
+
 	// send finish message to master
 	ok := call("Coordinator.FinishReduce", &FinishReduceRequest{TaskNum: task.Number}, &FinishReduceResponse{})
 	if !ok {
-		log.Fatal("failed to finish reduce")
+		//log.Fatal("failed to finish reduce")
+		fmt.Println("failed to finish reduce")
 	}
 
 	// this is the correct format for each line of Reduce output.
@@ -221,7 +222,7 @@ func Worker(mapf func(string, string) []KeyValue,
 			case ReduceTaskType:
 				DoReduce(reducef, task)
 			}
-			//fmt.Printf("the task is %v:%v \n", task.Number, task.Type)
+			fmt.Printf("the task is %v:%v \n", task.Number, task.Type)
 		} else {
 			time.Sleep(2 * time.Second)
 		}

@@ -37,8 +37,7 @@ type GetTaskResponse struct {
 
 type FinishMapRequest struct {
 	TaskNum      int
-	Key2FileMap  *map[string]string
-	IHash2KeyMap *map[int][]string
+	Hash2FileMap *map[int][]string
 }
 
 type FinishMapResponse struct {

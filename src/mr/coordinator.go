@@ -54,6 +54,9 @@ var InitReduce sync.Once
 func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error {
 	// there are still unfinished map tasks
 	if len(c.FinishedMapTask) < c.NMap {
+		// todo print log
+		//fmt.Printf("free map task : %v  \n", c.FreeMapTaskQueue)
+
 		// return map Task
 		data := c.FreeMapTaskQueue.Pop()
 		if data == nil {
@@ -73,9 +76,6 @@ func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error 
 		resp.Task = &task
 		resp.IsFinished = false
 	} else if len(c.FinishedReduceTask) < c.NReduce {
-		// return reduce Task
-		//fmt.Println("initializing reduce tasks")
-
 		// initialize reduce Task, only once
 		InitReduce.Do(func() {
 			for reduceNum, fs := range c.Hash2FileMap {
@@ -87,6 +87,9 @@ func (c *Coordinator) GetTask(req *GetTaskRequest, resp *GetTaskResponse) error 
 				c.FreeReduceTaskQueue.Offer(newTask)
 			}
 		})
+		// todo print log
+		//fmt.Printf("free reduce task : %v  \n", c.FreeReduceTaskQueue)
+
 		// get a free reduce Task and return
 		data := c.FreeReduceTaskQueue.Pop()
 		if data == nil {

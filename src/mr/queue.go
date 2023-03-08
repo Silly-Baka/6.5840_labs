@@ -1,6 +1,9 @@
 package mr
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // my implementation of concurrent queue
 type Queue struct {
@@ -10,32 +13,29 @@ type Queue struct {
 }
 
 func (q *Queue) Offer(k interface{}) {
-	for {
-		if q.mu.TryLock() {
-			q.data = append(q.data, k)
-			q.size++
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-			q.mu.Unlock()
-			break
-		}
-	}
+	q.data = append(q.data, k)
+	q.size++
 }
 
 func (q *Queue) Pop() interface{} {
+	q.mu.Lock()
+	defer q.mu.Unlock()
 
-	var res interface{}
-	for {
-		if q.mu.TryLock() {
-			if len(q.data) == 0 {
-				return nil
-			}
-			res = q.data[0]
-			q.data = q.data[1:]
-			q.size--
-
-			q.mu.Unlock()
-			break
-		}
+	if len(q.data) == 0 {
+		return nil
 	}
+	res := q.data[0]
+	q.data = q.data[1:]
+	q.size--
+
 	return res
+}
+
+// toString()
+
+func (q *Queue) String() string {
+	return fmt.Sprintln(q.data)
 }

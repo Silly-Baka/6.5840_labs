@@ -1,6 +1,6 @@
 package mr
 
 const (
-	MapTaskType    = 0
-	ReduceTaskType = 1
+	MapTaskType    = 100
+	ReduceTaskType = 200
 )

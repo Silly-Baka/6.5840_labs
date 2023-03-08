@@ -23,7 +23,7 @@ func main() {
 	}
 
 	m := mr.MakeCoordinator(os.Args[1:], 10)
-	//m := mr.MakeCoordinator([]string{"../pg-metamorphosis.txt", "../pg-frankenstein.txt"}, 10)
+	//m := mr.MakeCoordinator([]string{"../pg-metamorphosis.txt", "../pg-frankenstein.txt", "../pg-being_ernest.txt"}, 10)
 	for m.Done() == false {
 		time.Sleep(time.Second)
 	}

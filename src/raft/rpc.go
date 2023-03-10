@@ -10,6 +10,7 @@ type AppendEntriesArgs struct {
 	Entries      []LogEntry
 	PrevLogIndex int
 	PrevLogTerm  int
+	LeaderCommit int // leader's committed index
 }
 type AppendEntriesReply struct {
 	Term    int

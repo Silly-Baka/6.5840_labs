@@ -184,6 +184,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 	}
 	reply.Term = term
+
+	// todo: send message that has got requestVote to the backup
+	rf.heartBeatCh <- AppendEntriesArgs{
+		Term: term,
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -264,7 +269,6 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-
 		cond := sync.Cond{}
 
 		switch rf.state {
@@ -276,13 +280,14 @@ func (rf *Raft) ticker() {
 					eto := 200 + (rand.Int63() % 201)
 
 					timer := time.AfterFunc(time.Duration(eto)*time.Millisecond, func() {
+						// means no heartbeat or vote request
 						rf.heartBeatCh <- AppendEntriesArgs{Term: -1}
 					})
 					// check heartbeat, false if timeout
 					hasHeartbeat := <-rf.heartBeatCh
 
-					// reset election timeout
-					if hasHeartbeat.Term == -1 {
+					if hasHeartbeat.Term != -1 {
+						// reset election timeout
 						timer.Stop()
 					} else {
 						// become candidate
@@ -297,7 +302,7 @@ func (rf *Raft) ticker() {
 				}
 			}()
 		case Leader:
-			// todo 需要改善，缺少了新leader发出心跳后的逻辑，
+			// todo :  if get new leader's heartbeat, how to handle it
 			go func() {
 				// leader do heartbeat forever
 				for {
@@ -307,6 +312,7 @@ func (rf *Raft) ticker() {
 
 					reply := AppendEntriesReply{}
 					// heartbeat
+					// todo : change to rpc
 					ok := rf.AppendEntries(
 						&AppendEntriesArgs{
 							Term:     term,
@@ -333,6 +339,10 @@ func (rf *Raft) ticker() {
 				lastLogTerm = rf.log[l-1].term
 				lastLogIndex = l - 1
 			}
+
+			// vote for self
+			rf.votedFor = rf.me
+
 			rf.mu.Unlock()
 
 			args := RequestVoteArgs{
@@ -343,8 +353,10 @@ func (rf *Raft) ticker() {
 			}
 
 			voteCount := atomic.Int32{}
+			// add itself
+			voteCount.Store(1)
 
-			cond := sync.Cond{}
+			candidateCond := sync.Cond{}
 			for _, peer := range rf.peers {
 				go func() {
 					//ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
@@ -362,13 +374,11 @@ func (rf *Raft) ticker() {
 							defer rf.mu.Lock()
 
 							rf.state = Leader
-							cond.Broadcast()
+							candidateCond.Broadcast()
 						}
 					}
 				}()
 			}
-			// do not need to wait for all rpc
-
 			// this goroutine check heartbeat
 			go func() {
 				data := <-rf.heartBeatCh
@@ -380,30 +390,31 @@ func (rf *Raft) ticker() {
 				if data.Term >= rf.currentTerm {
 					rf.state = Follower
 				}
-				cond.Broadcast()
+				candidateCond.Broadcast()
 			}()
 			// this goroutine check timeout
 			go func() {
 				time.Sleep(5 * time.Second)
 
-				cond.Broadcast()
+				candidateCond.Broadcast()
 			}()
 
 			// waiting for the result of election
 			// 1)win  2) other leader  3) timeout
 			rf.mu.Lock()
-			cond.Wait()
+			candidateCond.Wait()
 
+			cond.Broadcast()
 		}
 
 		// waiting for state change
 		rf.mu.Lock()
 		cond.Wait()
 
-		//// pause for a random amount of time between 50 and 350
-		//// milliseconds.
-		//ms := 50 + (rand.Int63() % 300)
-		//time.Sleep(time.Duration(ms) * time.Millisecond)
+		// pause for a random amount of time between 50 and 350
+		// milliseconds.
+		ms := 50 + (rand.Int63() % 300)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -436,6 +447,25 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.heartBeatCh <- *args
+
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return nil
+	}
+
+	l := len(rf.log)
+	if args.PrevLogIndex < l && rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
+		reply.Success = false
+		// todo : modify in Lab2B: log replication
+		return nil
+	}
+
+	rf.currentTerm = args.Term
+
+	return nil
 }

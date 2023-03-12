@@ -71,7 +71,9 @@ type Raft struct {
 	// todo 待完善 当前用不到
 	log         []LogEntry // log
 	state       int        // follower、candidate、leader
-	heartBeatCh chan AppendEntriesArgs
+	heartBeatCh chan interface{}
+	voteCh      chan bool // check if got a vote request
+	hasLeader   bool
 }
 
 // return currentTerm and whether this server
@@ -161,7 +163,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
 	rf.mu.Lock()
-	var term = rf.currentTerm
+	//defer rf.mu.Unlock()
+	// reject if it has voted or it is Candidate（vote for itself)
+	if rf.votedFor != -1 || rf.state == Candidate {
+		DPrintf("[%v] reject vote to [%v]", rf.me, args.CandidateId)
+		rf.mu.Unlock()
+		reply.VoteGranted = false
+		return
+	}
+	term := rf.currentTerm
+
 	var lastLogTerm int
 	var lastLogIndex int
 	if len(rf.log) > 0 {
@@ -175,12 +186,15 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	} else if args.Term == term {
 		// check lastLogTerm and lastLogIndex
-		if args.LastLogTerm != lastLogTerm {
-			reply.VoteGranted = args.LastLogTerm > lastLogTerm
-		} else {
-			reply.VoteGranted = args.LastLogIndex >= lastLogIndex
+		if args.LastLogTerm > lastLogTerm {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
+		} else if args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex {
+			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
 		}
 	} else {
+		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 	}
 	reply.Term = term
@@ -189,6 +203,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.heartBeatCh <- AppendEntriesArgs{
 		Term: term,
 	}
+	//rf.voteCh <- true
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -269,7 +284,9 @@ func (rf *Raft) ticker() {
 
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		cond := sync.Cond{}
+		cond := sync.Cond{L: &rf.mu}
+
+		done := false
 
 		switch rf.state {
 		case Follower:
@@ -281,21 +298,33 @@ func (rf *Raft) ticker() {
 
 					timer := time.AfterFunc(time.Duration(eto)*time.Millisecond, func() {
 						// means no heartbeat or vote request
-						rf.heartBeatCh <- AppendEntriesArgs{Term: -1}
+						rf.heartBeatCh <- false
 					})
 					// check heartbeat, false if timeout
 					hasHeartbeat := <-rf.heartBeatCh
+					DPrintf("[%v] get heartbeat [%v]", rf.me, hasHeartbeat)
 
-					if hasHeartbeat.Term != -1 {
+					if hasHeartbeat != false {
 						// reset election timeout
+						hb, _ := hasHeartbeat.(AppendEntriesArgs)
+						DPrintf("[%v] get heartbeat from [%v]", rf.me, hb.LeaderId)
 						timer.Stop()
+
+						// clear voted for
+						rf.mu.Lock()
+						rf.votedFor = -1
+						rf.mu.Unlock()
+
 					} else {
 						// become candidate
+						DPrintf("[%v] election timeout, become candidate", rf.me)
+
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
 						rf.state = Candidate
 						rf.currentTerm++
 
+						done = true
 						cond.Broadcast()
 						return
 					}
@@ -305,24 +334,35 @@ func (rf *Raft) ticker() {
 			// todo :  if get new leader's heartbeat, how to handle it
 			go func() {
 				// leader do heartbeat forever
+				DPrintf("[%v] i am the leader!!!!", rf.me)
 				for {
 					// store information to avoid deadlock
+					rf.mu.Lock()
 					term := rf.currentTerm
 					leaderId := rf.me
+					rf.mu.Unlock()
 
-					reply := AppendEntriesReply{}
-					// heartbeat
-					// todo : change to rpc
-					ok := rf.AppendEntries(
-						&AppendEntriesArgs{
-							Term:     term,
-							LeaderId: leaderId,
-						},
-						&reply)
-					if !ok {
-						// todo: rpc error --> the peer crash or network partition -->  handle?
+					args := AppendEntriesArgs{
+						Term:     term,
+						LeaderId: leaderId,
 					}
+					// send heartbeat to each peer
+					// todo : change to rpc
+					for idx, _ := range rf.peers {
+						if idx == rf.me {
+							continue
+						}
+						// send heartbeat
+						go func() {
+							reply := AppendEntriesReply{}
+							DPrintf("[%v] leader send heartbeat to [%v]", rf.me, idx)
+							ok := rf.sendAppendEntries(idx, &args, &reply)
 
+							if !ok {
+								DPrintf("[%v] append entries to server [%v] error", rf.me, idx)
+							}
+						}()
+					}
 					// wait for 100ms
 					time.Sleep(HeartBeatTimeout)
 				}
@@ -356,15 +396,21 @@ func (rf *Raft) ticker() {
 			// add itself
 			voteCount.Store(1)
 
-			candidateCond := sync.Cond{}
-			for _, peer := range rf.peers {
-				go func() {
+			candidateCond := sync.Cond{L: &rf.mu}
+
+			for idx, p := range rf.peers {
+				if idx == rf.me {
+					continue
+				}
+				go func(server int, peer *labrpc.ClientEnd) {
+					DPrintf("[%v] requesting vote from [%v]", rf.me, server)
 					//ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 					reply := RequestVoteReply{}
 					ok := peer.Call("Raft.RequestVote", &args, &reply)
 					if !ok {
-						DPrintf("[%v] failed to request vote from [%v]", rf.me, peer)
+						DPrintf("[%v] failed to request vote from [%v]", rf.me, server)
 					} else if reply.VoteGranted {
+						DPrintf("[%v] success get vote from [%v]", rf.me, server)
 						ct := int(voteCount.Add(1))
 
 						// has been get majority votes
@@ -373,48 +419,77 @@ func (rf *Raft) ticker() {
 							rf.mu.Lock()
 							defer rf.mu.Lock()
 
-							rf.state = Leader
-							candidateCond.Broadcast()
+							// check leader
+							if !rf.hasLeader {
+								DPrintf("[%v] become leader", rf.me)
+								rf.state = Leader
+								rf.hasLeader = true
+								candidateCond.Broadcast()
+							}
 						}
 					}
-				}()
+				}(idx, p)
 			}
 			// this goroutine check heartbeat
 			go func() {
 				data := <-rf.heartBeatCh
+				hb, ok := data.(AppendEntriesArgs)
+				if !ok {
+					DPrintf("不知道什么错误")
+				}
+
+				DPrintf("[%v] candidate get heartbeat from [%v]", rf.me, hb.LeaderId)
 
 				rf.mu.Lock()
 				defer rf.mu.Lock()
 
 				// return follower if accept the new leader
-				if data.Term >= rf.currentTerm {
+				if hb.Term >= rf.currentTerm {
 					rf.state = Follower
+					rf.hasLeader = true
 				}
 				candidateCond.Broadcast()
 			}()
+			//// this goroutine check requestVote
+			//go func() {
+			//
+			//}()
 			// this goroutine check timeout
 			go func() {
-				time.Sleep(5 * time.Second)
+				eto := 200 + (rand.Int63() % 201)
+				time.Sleep(time.Duration(eto) * time.Millisecond)
 
-				candidateCond.Broadcast()
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				// check leader
+				if !rf.hasLeader {
+					DPrintf("[%v] election timeout", rf.me)
+
+					candidateCond.Broadcast()
+				}
 			}()
 
 			// waiting for the result of election
 			// 1)win  2) other leader  3) timeout
 			rf.mu.Lock()
 			candidateCond.Wait()
+			rf.mu.Unlock()
 
+			done = true
 			cond.Broadcast()
 		}
 
 		// waiting for state change
 		rf.mu.Lock()
-		cond.Wait()
+		for !done {
+			cond.Wait()
+		}
+		rf.mu.Unlock()
 
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		//ms := 50 + (rand.Int63() % 300)
+		//time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
@@ -437,6 +512,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = Follower
 	rf.votedFor = -1
+	rf.heartBeatCh = make(chan interface{})
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -451,7 +527,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.heartBeatCh <- *args
+	rf.heartBeatCh <- args
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -468,4 +544,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.currentTerm = args.Term
 
 	return nil
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, apply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, apply)
+
+	return ok
 }

@@ -162,6 +162,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if rf.killed() {
+		DPrintf("[%v] has been dead", rf.me)
+		reply.VoteGranted = false
+
+		return
+	}
+
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
@@ -174,9 +181,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state = Follower
 		rf.votedFor = -1
 	}
-	if rf.state == Leader {
-		DPrintf("[%v] leader's votedFor is [%v]", rf.me, rf.votedFor)
-	}
+
 	if rf.votedFor != -1 && args.CandidateId != rf.votedFor {
 		DPrintf("[%v] failed to vote for [%v]", rf.me, args.CandidateId)
 		reply.VoteGranted = false
@@ -249,6 +254,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < currentTerm {
 		reply.Success = false
 		reply.Term = currentTerm
+
+		DPrintf("[%v] reject the heartbeat from [%v]", rf.me, args.LeaderId)
 		return
 	}
 	if args.Term > currentTerm {
@@ -261,6 +268,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Success = true
 	rf.electionTimer.Reset(getElectionTimeout())
+	DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
 
 	return
 }
@@ -363,7 +371,7 @@ func (rf *Raft) newElection() {
 		CandidateId: rf.me,
 	}
 
-	//startTerm := rf.currentTerm
+	startTerm := rf.currentTerm
 	rf.mu.Unlock()
 
 	total := len(rf.peers)
@@ -384,6 +392,7 @@ func (rf *Raft) newElection() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
+			// term has been changed（become follower), or has been Leader
 			if rf.currentTerm != args.Term || rf.state != Candidate {
 				return
 			}
@@ -420,7 +429,7 @@ func (rf *Raft) newElection() {
 		rf.mu.Lock()
 
 		// higher term and become follower, or timeout（term has been incr)
-		if rf.state != Candidate {
+		if rf.state != Candidate || rf.killed() || rf.currentTerm != startTerm {
 			rf.mu.Unlock()
 			break
 		}
@@ -435,6 +444,7 @@ func (rf *Raft) newElection() {
 			rf.state = Leader
 			rf.mu.Unlock()
 
+			DPrintf("[%v] become leader", rf.me)
 			go rf.heartbeat()
 
 			break
@@ -449,7 +459,7 @@ func (rf *Raft) newElection() {
 
 // get election timeout between 200ms ~ 400ms randomly
 func getElectionTimeout() time.Duration {
-	ms := 500 + (rand.Int63() % 501)
+	ms := 200 + (rand.Int63() % 150)
 
 	return time.Duration(ms) * time.Millisecond
 }
@@ -509,6 +519,7 @@ func (rf *Raft) heartbeat() {
 
 // the real logic of heartbeat: send AppendEntries() to each peer if become leader
 func (rf *Raft) doHeartbeat(ch chan bool) {
+
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
 	prevLogIndex := 0
@@ -533,14 +544,23 @@ func (rf *Raft) doHeartbeat(ch chan bool) {
 		}
 		go func(server int) {
 			reply := AppendEntriesReply{}
+
+			rf.mu.Lock()
+			if rf.killed() || rf.state != Leader {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
+
 			DPrintf("[%v] leader send heartbeat to [%v]", rf.me, server)
 			ok := rf.sendAppendEntries(server, &args, &reply)
 			if !ok {
 				DPrintf("[%v] failed to send heartbeat to [%v]", rf.me, server)
 				return
 			}
-			// find higher term, convert to follower
+
 			rf.mu.Lock()
+			// find higher term, convert to follower
 			if reply.Term > rf.currentTerm {
 				DPrintf("[%v] find a new higher term and convert to follower", rf.me)
 

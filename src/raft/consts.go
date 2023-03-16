@@ -7,8 +7,5 @@ const (
 	Candidate = 0x2
 	Leader    = 0x3
 
-	//ElectionTimeout  = 350 * time.Millisecond
-	HeartBeatTimeout = 120 * time.Millisecond
-
-	HasNotVote = -1
+	HeartBeatTimeout = time.Duration(100) * time.Millisecond
 )

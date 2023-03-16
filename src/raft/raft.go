@@ -180,6 +180,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
+		DPrintf("[%v] find a new higher term and convert to follower", rf.me)
 	}
 
 	if rf.votedFor != -1 && args.CandidateId != rf.votedFor {
@@ -196,17 +197,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 
 	DPrintf("[%v] success to vote for [%v]", rf.me, args.CandidateId)
-
-	//var lastLogTerm int
-	//var lastLogIndex int
-	//if len(rf.log) > 0 {
-	//	lastLogTerm = rf.log[len(rf.log)-1].Term
-	//	lastLogIndex = len(rf.log) - 1
-	//}
-	//if args.LastLogTerm > lastLogTerm {
-	//
-	//}
-	//
 
 }
 
@@ -247,27 +237,34 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
 
 	rf.mu.Lock()
-	currentTerm := rf.currentTerm
-	//l := len(rf.log)
-	rf.mu.Unlock()
+	//defer rf.mu.Unlock()
 
-	if args.Term < currentTerm {
+	//currentTerm := rf.currentTerm
+	//l := len(rf.log)
+	//rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
 		reply.Success = false
-		reply.Term = currentTerm
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 
 		DPrintf("[%v] reject the heartbeat from [%v]", rf.me, args.LeaderId)
 		return
 	}
-	if args.Term > currentTerm {
-		rf.mu.Lock()
+	if args.Term > rf.currentTerm {
+		//rf.mu.Lock()
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
-		rf.mu.Unlock()
+		DPrintf("[%v] find a new higher term and convert to follower", rf.me)
+		//rf.mu.Unlock()
 	}
-
 	reply.Success = true
+
+	//rf.mu.Lock()
 	rf.electionTimer.Reset(getElectionTimeout())
+	rf.mu.Unlock()
+
 	DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
 
 	return
@@ -346,6 +343,7 @@ func (rf *Raft) ticker() {
 		//ms := 50 + (rand.Int63() % 300)
 		//time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
+	DPrintf("error!!!!!!!")
 }
 
 // start a new election
@@ -471,8 +469,8 @@ func (rf *Raft) heartbeat() {
 
 	ct := 1
 	// initialized heartbeat
-	go rf.doHeartbeat(DoneCh)
-	DPrintf("[%v] heartbeat [%v]", rf.me, ct)
+	rf.doHeartbeat(DoneCh)
+	//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
 
 	heartBeatTimer := time.NewTimer(HeartBeatTimeout)
 	isDone := false
@@ -480,36 +478,41 @@ func (rf *Raft) heartbeat() {
 	cond := sync.Cond{L: &rf.mu}
 
 	go func() {
-		select {
-		case <-heartBeatTimer.C:
-			rf.mu.Lock()
-			// stop heartbeat if not leader
-			if rf.killed() || rf.state != Leader {
-				rf.mu.Unlock()
-				heartBeatTimer.Stop()
-				isDone = true
+		for {
+			select {
+			case <-heartBeatTimer.C:
+				rf.mu.Lock()
+				// stop heartbeat if not leader
+				if rf.killed() || rf.state != Leader {
+					rf.mu.Unlock()
+					for !heartBeatTimer.Stop() {
+						<-heartBeatTimer.C
+					}
+					isDone = true
 
+					cond.Broadcast()
+					return
+				}
+				rf.mu.Unlock()
+
+				ct++
+				//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
+				rf.doHeartbeat(DoneCh)
+
+				heartBeatTimer.Reset(HeartBeatTimeout)
+
+			case <-DoneCh:
+				// stop heartbeat
+				for !heartBeatTimer.Stop() {
+					<-heartBeatTimer.C
+				}
+				isDone = true
 				cond.Broadcast()
+
 				return
 			}
-			rf.mu.Unlock()
-
-			heartBeatTimer.Reset(HeartBeatTimeout)
-
-			ct++
-			DPrintf("[%v] heartbeat [%v]", rf.me, ct)
-			go rf.doHeartbeat(DoneCh)
-
-		case <-DoneCh:
-			// stop heartbeat
-			heartBeatTimer.Stop()
-			isDone = true
-			cond.Broadcast()
-
-			return
 		}
 	}()
-
 	rf.mu.Lock()
 	for !isDone {
 		cond.Wait()
@@ -552,9 +555,8 @@ func (rf *Raft) doHeartbeat(ch chan bool) {
 			}
 			rf.mu.Unlock()
 
-			DPrintf("[%v] leader send heartbeat to [%v]", rf.me, server)
-			ok := rf.sendAppendEntries(server, &args, &reply)
-			if !ok {
+			//DPrintf("[%v] leader send heartbeat to [%v]", rf.me, server)
+			if ok := rf.sendAppendEntries(server, &args, &reply); !ok {
 				DPrintf("[%v] failed to send heartbeat to [%v]", rf.me, server)
 				return
 			}

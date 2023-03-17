@@ -68,7 +68,7 @@ type Raft struct {
 	votedFor      int         // index of target peer
 	log           []LogEntry  // log todo: 待完善 当前用不到
 	state         int         // follower、candidate、leader
-	electionTimer time.Ticker // timer that record election timeout
+	electionTimer *time.Timer // timer that record election timeout
 }
 
 // return currentTerm and whether this server
@@ -80,10 +80,13 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	term = rf.currentTerm
-	isleader = rf.state == Leader
+	if rf.state == Leader {
+		isleader = true
+	} else {
+		isleader = false
+	}
+	rf.mu.Unlock()
 
 	return term, isleader
 }
@@ -157,23 +160,12 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
-	// reset election timeout
-
 	rf.mu.Lock()
-	//defer rf.mu.Unlock()
-	//
-	//if rf.killed() {
-	//	DPrintf("[%v] has been dead", rf.me)
-	//	reply.VoteGranted = false
-	//	rf.mu.Unlock()
-	//
-	//	return
-	//}
+	defer rf.mu.Unlock()
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
-		rf.mu.Unlock()
 
 		DPrintf("[%v] failed to vote for [%v]", rf.me, args.CandidateId)
 		return
@@ -186,11 +178,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("[%v] find a new higher term and convert to follower", rf.me)
 	}
 
-	if rf.votedFor != -1 && args.CandidateId != rf.votedFor {
+	if args.Term == rf.currentTerm && rf.votedFor != -1 && args.CandidateId != rf.votedFor {
 		DPrintf("[%v] failed to vote for [%v]", rf.me, args.CandidateId)
 		reply.VoteGranted = false
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 
 		return
 	}
@@ -199,17 +190,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.votedFor = args.CandidateId
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
-	rf.electionTimer.Reset(rf.getElectionTimeout())
-	//DPrintf("[%v] reset %v", rf.me, rf.electionTimer.Reset(rf.getElectionTimeout()))
+
 	//if !rf.electionTimer.Stop() {
 	//	<-rf.electionTimer.C
 	//}
-	//rf.electionTimer = *time.NewTimer(rf.getElectionTimeout())
-
-	rf.mu.Unlock()
+	rf.electionTimer.Reset(getElectionTimeout())
 
 	DPrintf("[%v] success to vote for [%v]", rf.me, args.CandidateId)
-
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -251,10 +238,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	//defer rf.mu.Unlock()
 
-	//currentTerm := rf.currentTerm
-	//l := len(rf.log)
-	//rf.mu.Unlock()
-
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -269,21 +252,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.state = Follower
 		DPrintf("[%v] find a new higher term and convert to follower", rf.me)
-		//rf.mu.Unlock()
 	}
-	reply.Success = true
-	rf.electionTimer.Reset(rf.getElectionTimeout())
-	//DPrintf("[%v] reset %v", rf.me, rf.electionTimer.Reset(rf.getElectionTimeout()))
+
 	//if !rf.electionTimer.Stop() {
 	//	<-rf.electionTimer.C
 	//}
-	//rf.electionTimer = *time.NewTimer(rf.getElectionTimeout())
+	//DPrintf("reset election timeout %v", rf.electionTimer.Reset(getElectionTimeout()))
 
+	rf.electionTimer.Reset(getElectionTimeout())
 	rf.mu.Unlock()
 
-	DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
+	reply.Success = true
 
-	return
+	DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -329,39 +310,34 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
+	//z := atomic.LoadInt32(&rf.dead)
+	return false
 }
 
 func (rf *Raft) ticker() {
 
-	//testTimer := time.NewTimer(time.Duration(1000) * time.Millisecond)
+	//testTimer := time.NewTimer(300 * time.Millisecond)
 	for rf.killed() == false {
-
 		// Your code here (2A)
-		// Check if a leader election should be started.
+		//Check if a leader election should be started.
 		select {
-		// blocking and wait for election timeout
 		case <-rf.electionTimer.C:
-			DPrintf("[%v] election timeout, start new election", rf.me)
-
 			rf.mu.Lock()
 			if rf.state == Leader {
 				rf.mu.Unlock()
 				break
 			}
 			rf.state = Candidate
+
 			rf.mu.Unlock()
 
-			//rf.electionTimer.Reset(rf.getElectionTimeout())
-			//DPrintf("[%v] election reset %v", rf.me, rf.electionTimer.Reset(rf.getElectionTimeout()))
-			go rf.newElection()
+			DPrintf("[%v] election timeout, start new election", rf.me)
+			rf.newElection()
+			rf.electionTimer.Reset(getElectionTimeout())
+			//case <-testTimer.C:
+			//	DPrintf("[%v] still waiting for election timeout", rf.me)
+			//	testTimer.Reset(300 * time.Millisecond)
 		}
-
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		//ms := 50 + (rand.Int63() % 300)
-		//time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 	DPrintf("error!!!!!!!")
 }
@@ -375,16 +351,12 @@ func (rf *Raft) newElection() {
 
 	// vote for self
 	rf.votedFor = rf.me
-	rf.electionTimer.Reset(rf.getElectionTimeout())
-	//rf.electionTimer = *time.NewTimer(rf.getElectionTimeout())
 
-	//lastLogTerm := 0
-	//lastLogIndex := 0
-	//l := len(rf.log)
-	//if l > 0 {
-	//	lastLogTerm = rf.log[l-1].Term
-	//	lastLogIndex = l
+	//if !rf.electionTimer.Stop() {
+	//	<-rf.electionTimer.C
 	//}
+	rf.electionTimer.Reset(getElectionTimeout())
+
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
@@ -392,7 +364,7 @@ func (rf *Raft) newElection() {
 	rf.mu.Unlock()
 
 	total := len(rf.peers)
-	voteCh := make(chan bool, total-1)
+	voteCh := make(chan bool, total)
 	// get vote from each peer
 	for idx, _ := range rf.peers {
 		if idx == rf.me {
@@ -400,6 +372,10 @@ func (rf *Raft) newElection() {
 		}
 		// request vote async
 		go func(server int) {
+
+			if rf.killed() {
+				return
+			}
 			reply := RequestVoteReply{}
 			DPrintf("[%v] request vote to [%v]", rf.me, server)
 			if ok := rf.sendRequestVote(server, &args, &reply); !ok {
@@ -408,9 +384,10 @@ func (rf *Raft) newElection() {
 				return
 			}
 			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
 			// term has been changed（become follower), or has been Leader
-			if rf.currentTerm != args.Term || rf.state != Candidate {
-				rf.mu.Unlock()
+			if rf.currentTerm != args.Term || rf.state != Candidate || rf.killed() {
 
 				voteCh <- false
 				return
@@ -424,13 +401,11 @@ func (rf *Raft) newElection() {
 				rf.state = Follower
 				rf.votedFor = -1
 				//rf.electionTimer.Reset(getElectionTimeout())
-				rf.mu.Unlock()
 
 				// todo
 				voteCh <- false
 				return
 			}
-			rf.mu.Unlock()
 
 			if reply.VoteGranted {
 				DPrintf("[%v] success get vote from [%v]", rf.me, server)
@@ -446,11 +421,10 @@ func (rf *Raft) newElection() {
 	// wait for result / how to do if timeout
 	for voteGranted := range voteCh {
 
-		// record only candidate
 		rf.mu.Lock()
 
 		// higher term and become follower, or timeout（term has been incr)
-		if rf.state != Candidate || rf.currentTerm != args.Term {
+		if rf.state != Candidate || rf.currentTerm != args.Term || rf.killed() {
 			DPrintf("[%v] failed in the election", rf.me)
 			rf.mu.Unlock()
 			break
@@ -464,6 +438,8 @@ func (rf *Raft) newElection() {
 		if voteCount > total/2 {
 			rf.mu.Lock()
 			rf.state = Leader
+
+			// stop the election timeout
 			rf.mu.Unlock()
 
 			DPrintf("[%v] become leader", rf.me)
@@ -480,12 +456,11 @@ func (rf *Raft) newElection() {
 }
 
 // get election timeout between 200ms ~ 400ms randomly
-func (rf *Raft) getElectionTimeout() time.Duration {
-	ms := 240 + (rand.Int63() % 200)
-
-	time := time.Duration(ms) * time.Millisecond
-	DPrintf("[%v] new election time:[%v]", rf.me, time)
-	return time
+func getElectionTimeout() time.Duration {
+	ms := 200 + (rand.Int63() % 150)
+	//time := time.Duration(ms) * time.Millisecond
+	//DPrintf("[%v] new election time:[%v]", rf.me, time)
+	return time.Duration(ms) * time.Millisecond
 }
 
 // control the leader's heartbeat cycle
@@ -496,12 +471,10 @@ func (rf *Raft) heartbeat() {
 	DoneCh := make(chan bool, 1)
 
 	// initialized heartbeat
-	go func(ch *chan bool) {
-		rf.doHeartbeat(ch)
-	}(&DoneCh)
+	go rf.doHeartbeat(DoneCh)
 	//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
 
-	heartBeatTimer := time.NewTimer(HeartBeatTimeout)
+	heartBeatTimer := time.NewTicker(HeartBeatTimeout)
 	isDone := false
 
 	cond := sync.Cond{L: &rf.mu}
@@ -512,28 +485,25 @@ func (rf *Raft) heartbeat() {
 			case <-heartBeatTimer.C:
 				rf.mu.Lock()
 				// stop heartbeat if not leader
-				if rf.state != Leader {
+				if rf.killed() || rf.state != Leader {
 					rf.mu.Unlock()
 
 					isDone = true
+					heartBeatTimer.Stop()
 
 					cond.Broadcast()
 					return
 				}
 				rf.mu.Unlock()
 				//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
-				go func(ch *chan bool) {
-					rf.doHeartbeat(ch)
-				}(&DoneCh)
+				go rf.doHeartbeat(DoneCh)
 
-				if !heartBeatTimer.Stop() {
-					<-heartBeatTimer.C
-				}
-				heartBeatTimer = time.NewTimer(HeartBeatTimeout)
+				heartBeatTimer.Reset(HeartBeatTimeout)
 
 			case <-DoneCh:
-
 				isDone = true
+				heartBeatTimer.Stop()
+
 				cond.Broadcast()
 
 				return
@@ -548,7 +518,7 @@ func (rf *Raft) heartbeat() {
 }
 
 // the real logic of heartbeat: send AppendEntries() to each peer if become leader
-func (rf *Raft) doHeartbeat(ch *chan bool) {
+func (rf *Raft) doHeartbeat(ch chan bool) {
 
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
@@ -576,7 +546,7 @@ func (rf *Raft) doHeartbeat(ch *chan bool) {
 			reply := AppendEntriesReply{}
 
 			rf.mu.Lock()
-			if rf.state != Leader {
+			if rf.killed() || rf.state != Leader {
 				rf.mu.Unlock()
 				return
 			}
@@ -596,10 +566,10 @@ func (rf *Raft) doHeartbeat(ch *chan bool) {
 				rf.currentTerm = reply.Term
 				rf.state = Follower
 				rf.votedFor = -1
-				rf.mu.Unlock()
 				//rf.electionTimer.Reset(getElectionTimeout())
+				rf.mu.Unlock()
 
-				*ch <- false
+				ch <- false
 				return
 			}
 			rf.mu.Unlock()
@@ -626,7 +596,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.state = Follower
 	rf.votedFor = -1
-	rf.electionTimer = *time.NewTicker(rf.getElectionTimeout())
+	rf.electionTimer = time.NewTimer(getElectionTimeout())
 	rf.currentTerm = 0
 
 	// initialize from state persisted before a crash

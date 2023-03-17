@@ -457,7 +457,7 @@ func (rf *Raft) newElection() {
 
 // get election timeout between 200ms ~ 400ms randomly
 func getElectionTimeout() time.Duration {
-	ms := 200 + (rand.Int63() % 150)
+	ms := 200 + (rand.Int63() % 100)
 	//time := time.Duration(ms) * time.Millisecond
 	//DPrintf("[%v] new election time:[%v]", rf.me, time)
 	return time.Duration(ms) * time.Millisecond
@@ -486,10 +486,10 @@ func (rf *Raft) heartbeat() {
 				rf.mu.Lock()
 				// stop heartbeat if not leader
 				if rf.killed() || rf.state != Leader {
-					rf.mu.Unlock()
-
 					isDone = true
 					heartBeatTimer.Stop()
+
+					rf.mu.Unlock()
 
 					cond.Broadcast()
 					return
@@ -501,8 +501,10 @@ func (rf *Raft) heartbeat() {
 				heartBeatTimer.Reset(HeartBeatTimeout)
 
 			case <-DoneCh:
+				rf.mu.Lock()
 				isDone = true
 				heartBeatTimer.Stop()
+				rf.mu.Unlock()
 
 				cond.Broadcast()
 

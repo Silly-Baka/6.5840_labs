@@ -23,7 +23,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
 	"6.5840/labrpc"
 )
 
@@ -73,11 +72,12 @@ type Raft struct {
 
 	// 2B
 	log         []LogEntry // log
-	logSize     int        // the length of the log
+	myNextIndex int        // the next index of the log
 	commitIndex int        // the highest index of log has been committed
 	lastReplied int        // the highest index of log has been replied to local state machine
 	nextIndex   []int      // the next index of log will be sent to follower
 	matchIndex  []int      // maintained with AppendEntries()
+	applyCh     chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -196,10 +196,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// restriction
-	if rf.logSize > 0 {
-		lastLogTerm := rf.log[rf.logSize-1].Term
+	if rf.myNextIndex > 1 {
+		lastLogTerm := rf.log[rf.myNextIndex-1].Term
 		if lastLogTerm == args.LastLogTerm {
-			if rf.logSize-1 < args.LastLogIndex {
+			if rf.myNextIndex-1 < args.LastLogIndex {
 				reply.VoteGranted = false
 				reply.Term = rf.currentTerm
 				return
@@ -255,7 +255,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
-	DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
+	//DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -264,7 +264,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		reply.Term = rf.currentTerm
 
-		DPrintf("[%v] reject the heartbeat from [%v]", rf.me, args.LeaderId)
+		//DPrintf("[%v] reject the heartbeat from [%v]", rf.me, args.LeaderId)
 		return
 	}
 	if args.Term > rf.currentTerm {
@@ -275,53 +275,62 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	rf.electionTimer.Reset(getElectionTimeout())
 
-	DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
+	//DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
 
 	// 2B
-
 	// todo: 等待优化算法
 	// have found out the conflicting log
-	if rf.logSize-1 >= args.PrevLogIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= 0 && rf.myNextIndex-1 >= args.PrevLogIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 
 		// delete the conflicting log
-		rf.logSize = args.PrevLogIndex
+		rf.myNextIndex = args.PrevLogIndex
 		if args.PrevLogIndex > 0 {
 			rf.log = rf.log[:args.PrevLogIndex-1]
 		}
 
 		return
 	}
-
 	newLogIndex := args.PrevLogIndex + 1
 	// append entries
 	for _, entry := range args.Entries {
 		// have this entry
-		if rf.logSize-1 >= newLogIndex {
+		if rf.myNextIndex-1 >= newLogIndex {
 			newLogIndex++
 			continue
 		}
 		// append into log
-		if newLogIndex >= rf.logSize {
+		if newLogIndex >= rf.myNextIndex {
 			rf.log = append(rf.log, entry)
 		} else {
 			rf.log[newLogIndex] = entry
 		}
-		rf.logSize++
+		rf.myNextIndex++
 		newLogIndex++
 	}
 
 	// check commitIndex and reply the entry
 	if args.LeaderCommit > rf.commitIndex {
 		// commit entry and reset commitIndex
-		if args.LeaderCommit < rf.logSize-1 {
+		if args.LeaderCommit < rf.myNextIndex {
 			rf.commitIndex = args.LeaderCommit
 		} else {
-			rf.commitIndex = rf.logSize - 1
+			rf.commitIndex = rf.myNextIndex - 1
 		}
 
 		// todo: reply the entry
-		rf.lastReplied = rf.commitIndex
+		// send applyMsg to kv server
+		for rf.lastReplied < rf.commitIndex {
+			rf.lastReplied++
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastReplied].Command,
+				CommandIndex: rf.lastReplied,
+			}
+			rf.applyCh <- applyMsg
+		}
+
+		DPrintf("[%v] follower commitIndex change to %v", rf.me, rf.commitIndex)
 	}
 
 	reply.Success = true
@@ -360,9 +369,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.log = append(rf.log, NewEntry)
-	index := rf.logSize
+	index := rf.myNextIndex
 	term := rf.currentTerm
-	rf.logSize++
+	rf.myNextIndex++
+
+	DPrintf("[%v] leader start new command, index is %v", rf.me, index)
+
+	go rf.doHeartbeat(nil)
 
 	return index, term, rf.state == Leader
 }
@@ -513,7 +526,7 @@ func (rf *Raft) newElection() {
 
 			// init nextIndex
 			for i := range rf.nextIndex {
-				rf.nextIndex[i] = rf.logSize
+				rf.nextIndex[i] = rf.myNextIndex
 			}
 
 			rf.mu.Unlock()
@@ -600,10 +613,10 @@ func (rf *Raft) doHeartbeat(ch chan bool) {
 
 	rf.mu.Lock()
 	currentTerm := rf.currentTerm
-	prevLogIndex := 0
-	prevLogTerm := 0
-	if rf.logSize > 0 {
-		prevLogIndex = rf.logSize - 1
+	prevLogIndex := -1
+	prevLogTerm := -1
+	if rf.myNextIndex > 1 {
+		prevLogIndex = rf.myNextIndex - 1
 		prevLogTerm = rf.log[prevLogIndex].Term
 	}
 	leaderCommit := rf.commitIndex
@@ -628,7 +641,10 @@ func (rf *Raft) doHeartbeat(ch chan bool) {
 					PrevLogIndex: prevLogIndex,
 					PrevLogTerm:  prevLogTerm,
 					LeaderCommit: leaderCommit,
-					Entries:      rf.log[:rf.nextIndex[server]],
+				}
+				// appendEntries() only if have new Entries
+				if rf.nextIndex[server] < rf.myNextIndex {
+					args.Entries = rf.log[rf.nextIndex[server]:rf.myNextIndex]
 				}
 				reply := AppendEntriesReply{}
 
@@ -661,7 +677,9 @@ func (rf *Raft) doHeartbeat(ch chan bool) {
 					//rf.electionTimer.Reset(getElectionTimeout())
 					rf.mu.Unlock()
 
-					ch <- false
+					if ch != nil {
+						ch <- false
+					}
 					return
 				}
 				rf.mu.Unlock()
@@ -669,14 +687,23 @@ func (rf *Raft) doHeartbeat(ch chan bool) {
 				if reply.Success {
 					successCount.Add(1)
 					if int(successCount.Load()) > len(rf.peers)/2 {
+						if !isMajorityAgree {
+							DPrintf("[%v] leader success append entries to majority followers", rf.me)
+						}
 						isMajorityAgree = true
 						cond.Broadcast()
 					}
+					rf.mu.Lock()
+					rf.nextIndex[server] = rf.myNextIndex
+					rf.mu.Unlock()
+
 					return
 				} else {
 					// decrement the nextIndex and retry AppendEntries()
 					rf.mu.Lock()
-					rf.nextIndex[server]--
+					if rf.nextIndex[server] > 0 {
+						rf.nextIndex[server]--
+					}
 					rf.mu.Unlock()
 				}
 			}
@@ -688,9 +715,22 @@ func (rf *Raft) doHeartbeat(ch chan bool) {
 	if !isMajorityAgree {
 		cond.Wait()
 	}
+	// update commitIndex
+	if rf.myNextIndex-1 > rf.commitIndex {
+		rf.commitIndex = rf.myNextIndex - 1
 
-	if rf.logSize-1 > rf.commitIndex {
-		rf.commitIndex = rf.logSize - 1
+		// send applyMsg to kv server
+		for rf.lastReplied < rf.commitIndex {
+			rf.lastReplied++
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[rf.lastReplied].Command,
+				CommandIndex: rf.lastReplied,
+			}
+			rf.applyCh <- applyMsg
+		}
+
+		DPrintf("[%v] leader commit log to index %v", rf.me, rf.commitIndex)
 	}
 
 	rf.mu.Unlock()
@@ -719,12 +759,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 
 	// 2B
-	rf.log = make([]LogEntry, 0)
-	rf.logSize = 0
-	rf.commitIndex = 0
-	rf.lastReplied = 0
+	rf.log = make([]LogEntry, 1)
+	rf.log[0] = LogEntry{Term: 0}
+
+	rf.myNextIndex = 1
+	rf.commitIndex = -1
+	rf.lastReplied = -1
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

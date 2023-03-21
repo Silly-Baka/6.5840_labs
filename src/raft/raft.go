@@ -200,12 +200,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if rf.myNextIndex > 1 {
 		lastLogTerm := rf.log[rf.myNextIndex-1].Term
 		if lastLogTerm == args.LastLogTerm {
-			if rf.myNextIndex-1 < args.LastLogIndex {
+			if rf.myNextIndex-1 > args.LastLogIndex {
 				reply.VoteGranted = false
 				reply.Term = rf.currentTerm
 				return
 			}
-		} else if lastLogTerm < args.LastLogTerm {
+		} else if lastLogTerm > args.LastLogTerm {
 			reply.VoteGranted = false
 			reply.Term = rf.currentTerm
 			return
@@ -257,6 +257,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
 	//DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
+	DPrintf("[%v] cur log is %v", rf.me, rf.log)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -279,7 +280,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
 
 	// 2B
-	// todo: 等待优化算法
 	// have found out the conflicting log
 	if args.PrevLogIndex >= 0 && rf.myNextIndex > args.PrevLogIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
@@ -303,9 +303,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		return
 	}
-	// append entries
+	//
+	//// if log less than leader and no append entries（heartbeat check)
+	//if args.PrevLogIndex+1 >= rf.myNextIndex && len(args.Entries) == 0 {
+	//	reply.Success = false
+	//	reply.XIndex = rf.myNextIndex
+	//
+	//	return
+	//}
+
+	// append entries if have new entries
 	for _, entry := range args.Entries {
-		// if log longer than leader
+		// if the log longer than leader
 		if rf.myNextIndex > args.PrevLogIndex+1 {
 			// cut the conflicting log
 			rf.log = rf.log[:args.PrevLogIndex]
@@ -383,7 +392,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DPrintf("[%v] leader start new command, index is %v", rf.me, index)
 
 	// sync the log immediately
-	go rf.doHeartbeat()
+	go rf.leaderAppendEntries()
 
 	return index, term, isLeader
 }
@@ -597,6 +606,8 @@ func (rf *Raft) heartbeat() {
 				//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
 				go rf.doHeartbeat()
 
+				DPrintf("[%v] leader, nextIndex array is %v", rf.me, rf.nextIndex)
+
 				heartBeatTimer.Reset(HeartBeatTimeout)
 
 			case <-rf.doneCh:
@@ -632,6 +643,143 @@ func (rf *Raft) doHeartbeat() {
 	leaderCommit := rf.commitIndex
 	rf.mu.Unlock()
 
+	// send appendEntries to each peer
+	for idx, _ := range rf.peers {
+		if idx == rf.me {
+			continue
+		}
+		go func(server int) {
+			rf.mu.Lock()
+			args := AppendEntriesArgs{
+				Term:         currentTerm,
+				LeaderId:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				LeaderCommit: leaderCommit,
+			}
+
+			reply := AppendEntriesReply{}
+
+			if rf.killed() || rf.state != Leader {
+				rf.mu.Unlock()
+				return
+			}
+			rf.mu.Unlock()
+
+			//DPrintf("[%v] leader send heartbeat to [%v]", rf.me, server)
+			if ok := rf.sendAppendEntries(server, &args, &reply); !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			// find higher term, convert to follower
+			if reply.Term > rf.currentTerm {
+				DPrintf("[%v] find a new higher term and convert to follower", rf.me)
+
+				rf.currentTerm = reply.Term
+				rf.state = Follower
+				rf.votedFor = -1
+				//rf.electionTimer.Reset(getElectionTimeout())
+				rf.mu.Unlock()
+
+				rf.doneCh <- false
+
+				return
+			}
+
+			// follower's log is later than leader
+			//if !reply.Success && reply.XIndex != -1 {
+			//	rf.nextIndex[server] = reply.XIndex
+			//	rf.matchIndex[server] = reply.XIndex - 1
+			//
+			//	// start appendEntries
+			//	//go func(sv int) {
+			//	//	for {
+			//	//		rf.mu.Lock()
+			//	//		args := AppendEntriesArgs{
+			//	//			Term:         currentTerm,
+			//	//			LeaderId:     rf.me,
+			//	//			PrevLogIndex: prevLogIndex,
+			//	//			PrevLogTerm:  prevLogTerm,
+			//	//			LeaderCommit: leaderCommit,
+			//	//		}
+			//	//		nextIndex := rf.myNextIndex
+			//	//		tmpIndex := rf.nextIndex[sv]
+			//	//
+			//	//		// appendEntries() only if have new Entries
+			//	//		if rf.nextIndex[sv] < nextIndex {
+			//	//			args.Entries = rf.log[rf.nextIndex[sv]:nextIndex]
+			//	//		}
+			//	//		reply := AppendEntriesReply{}
+			//	//
+			//	//		if rf.killed() || rf.state != Leader {
+			//	//			rf.mu.Unlock()
+			//	//			return
+			//	//		}
+			//	//		rf.mu.Unlock()
+			//	//
+			//	//		DPrintf("[%v] leader send appendEntries to [%v] : %v", rf.me, sv, args)
+			//	//		if ok := rf.sendAppendEntries(sv, &args, &reply); !ok && len(args.Entries) > 0 {
+			//	//			// maybe the peer crash, we should retry if necessary（have new entries)
+			//	//			continue
+			//	//		}
+			//	//
+			//	//		rf.mu.Lock()
+			//	//		// find higher term, convert to follower
+			//	//		if reply.Term > rf.currentTerm {
+			//	//			DPrintf("[%v] find a new higher term and convert to follower", rf.me)
+			//	//
+			//	//			rf.currentTerm = reply.Term
+			//	//			rf.state = Follower
+			//	//			rf.votedFor = -1
+			//	//			//rf.electionTimer.Reset(getElectionTimeout())
+			//	//			rf.mu.Unlock()
+			//	//
+			//	//			return
+			//	//		}
+			//	//		rf.mu.Unlock()
+			//	//
+			//	//		if reply.Success {
+			//	//			rf.mu.Lock()
+			//	//			// defend another later heartbeat change it
+			//	//			if rf.nextIndex[server] == tmpIndex {
+			//	//				rf.nextIndex[server] = nextIndex
+			//	//				rf.matchIndex[server] = nextIndex - 1
+			//	//			}
+			//	//			rf.mu.Unlock()
+			//	//			return
+			//	//		} else {
+			//	//			rf.mu.Lock()
+			//	//			// decrement the nextIndex and retry AppendEntries()
+			//	//			if reply.XTerm != -1 {
+			//	//				rf.nextIndex[server] = reply.XIndex
+			//	//				// todo
+			//	//				rf.matchIndex[server] = reply.XIndex - 1
+			//	//			}
+			//	//			rf.mu.Unlock()
+			//	//		}
+			//	//	}
+			//	//}(server)
+			//}
+			rf.mu.Unlock()
+		}(idx)
+	}
+}
+
+// the real logic of heartbeat: send AppendEntries() to each peer if become leader
+func (rf *Raft) leaderAppendEntries() {
+
+	rf.mu.Lock()
+	currentTerm := rf.currentTerm
+	prevLogIndex := 0
+	prevLogTerm := 0
+	if rf.myNextIndex > 1 {
+		prevLogIndex = rf.myNextIndex - 1
+		prevLogTerm = rf.log[prevLogIndex].Term
+	}
+	leaderCommit := rf.commitIndex
+	rf.mu.Unlock()
+
 	cond := sync.Cond{L: &rf.mu}
 	successCount := atomic.Int32{}
 	successCount.Store(1)
@@ -654,6 +802,7 @@ func (rf *Raft) doHeartbeat() {
 				}
 				nextIndex := rf.myNextIndex
 				tmpIndex := rf.nextIndex[server]
+
 				// appendEntries() only if have new Entries
 				if rf.nextIndex[server] < nextIndex {
 					args.Entries = rf.log[rf.nextIndex[server]:nextIndex]
@@ -666,12 +815,9 @@ func (rf *Raft) doHeartbeat() {
 				}
 				rf.mu.Unlock()
 
-				//DPrintf("[%v] leader send heartbeat to [%v]", rf.me, server)
-
+				DPrintf("[%v] leader send appendEntries to [%v] : %v", rf.me, server, args)
 				if ok := rf.sendAppendEntries(server, &args, &reply); !ok && len(args.Entries) > 0 {
-					// maybe the peer crash, we should retry if valid
-
-					//time.Sleep(10 * time.Millisecond)
+					// maybe the peer crash, we should retry if necessary（have new entries)
 					continue
 				}
 
@@ -685,8 +831,6 @@ func (rf *Raft) doHeartbeat() {
 					rf.votedFor = -1
 					//rf.electionTimer.Reset(getElectionTimeout())
 					rf.mu.Unlock()
-
-					rf.doneCh <- false
 
 					return
 				}

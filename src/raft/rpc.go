@@ -14,4 +14,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	XTerm   int // the term of conflicting log , -1 if no conflict
+	XIndex  int // the first index of XTerm, -1 if no conflict
 }

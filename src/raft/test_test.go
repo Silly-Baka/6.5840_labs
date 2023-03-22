@@ -305,7 +305,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(106, servers, true)
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(107, servers, true)
-	time.Sleep(RaftElectionTimeout)
+	//time.Sleep(RaftElectionTimeout)
 
 	cfg.end()
 }
@@ -473,6 +473,7 @@ func TestRejoin2B(t *testing.T) {
 
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
+	DPrintf("old leader %v disconnect", leader1)
 	cfg.disconnect(leader1)
 
 	// make old leader try to agree on some entries
@@ -485,14 +486,17 @@ func TestRejoin2B(t *testing.T) {
 
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
+	DPrintf("new leader %v disconnect", leader2)
 	cfg.disconnect(leader2)
 
 	// old leader connected again
+	DPrintf("old leader %v reconnect", leader1)
 	cfg.connect(leader1)
 
 	cfg.one(104, 2, true)
 
 	// all together now
+	DPrintf("new leader %v reconnect", leader2)
 	cfg.connect(leader2)
 
 	cfg.one(105, servers, true)

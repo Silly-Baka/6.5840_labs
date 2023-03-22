@@ -50,6 +50,7 @@ type ApplyMsg struct {
 // todo 尚未完善的Entry定义
 type LogEntry struct {
 	Term    int         // the term when receive the command
+	Index   int         // the index which the entry in log
 	Command interface{} // command
 }
 
@@ -262,6 +263,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	reply.XIndex = -1
+	reply.XTerm = -1
+
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -280,7 +284,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	//DPrintf("[%v] agree the heartbeat from [%v]", rf.me, args.LeaderId)
 
 	// 2B
-	// have found out the conflicting log
+	// find conflicting log and duplicate them
 	if args.PrevLogIndex >= 0 && rf.myNextIndex > args.PrevLogIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 
@@ -300,28 +304,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if xIndex > 0 {
 			rf.log = rf.log[:xIndex]
 		}
-
 		return
 	}
-	//
-	//// if log less than leader and no append entries（heartbeat check)
-	//if args.PrevLogIndex+1 >= rf.myNextIndex && len(args.Entries) == 0 {
-	//	reply.Success = false
-	//	reply.XIndex = rf.myNextIndex
-	//
-	//	return
-	//}
 
-	// append entries if have new entries
+	// append entries
 	for _, entry := range args.Entries {
-		// if the log longer than leader
-		if rf.myNextIndex > args.PrevLogIndex+1 {
-			// cut the conflicting log
-			rf.log = rf.log[:args.PrevLogIndex]
-			rf.myNextIndex = args.PrevLogIndex
+		if rf.myNextIndex > entry.Index {
+			// find conflicting entry
+			if rf.log[entry.Index].Term != entry.Term {
+				rf.log = rf.log[:entry.Index]
+				reply.XTerm = entry.Term
+				reply.XIndex = entry.Index
+				reply.Success = false
+				return
+			} else {
+				continue
+			}
+		} else {
+			rf.log = append(rf.log, entry)
+			rf.myNextIndex++
 		}
-		rf.log = append(rf.log, entry)
-		rf.myNextIndex++
 	}
 
 	// check commitIndex and reply the entry
@@ -351,6 +353,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	DPrintf("[%v] leader, nextIndex array is %v", rf.me, rf.nextIndex)
+
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 
 	return ok
@@ -380,6 +384,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// wrap the command into entry
 	NewEntry := LogEntry{
 		Term:    rf.currentTerm,
+		Index:   rf.myNextIndex,
 		Command: command,
 	}
 	rf.log = append(rf.log, NewEntry)
@@ -606,8 +611,6 @@ func (rf *Raft) heartbeat() {
 				//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
 				go rf.doHeartbeat()
 
-				DPrintf("[%v] leader, nextIndex array is %v", rf.me, rf.nextIndex)
-
 				heartBeatTimer.Reset(HeartBeatTimeout)
 
 			case <-rf.doneCh:
@@ -656,6 +659,7 @@ func (rf *Raft) doHeartbeat() {
 				PrevLogIndex: prevLogIndex,
 				PrevLogTerm:  prevLogTerm,
 				LeaderCommit: leaderCommit,
+				Entries:      nil,
 			}
 
 			reply := AppendEntriesReply{}
@@ -686,81 +690,61 @@ func (rf *Raft) doHeartbeat() {
 
 				return
 			}
+			// appendEntries check
+			if !reply.Success {
+				rf.nextIndex[server] = reply.XIndex
+				rf.matchIndex[server] = reply.XIndex - 1
+				go func() {
+					for {
+						args := AppendEntriesArgs{
+							Term:         rf.currentTerm,
+							LeaderId:     rf.me,
+							Entries:      rf.log[reply.XIndex:rf.myNextIndex],
+							PrevLogIndex: prevLogIndex,
+							PrevLogTerm:  prevLogTerm,
+							LeaderCommit: rf.commitIndex,
+						}
+						reply := AppendEntriesReply{}
+						if ok := rf.sendAppendEntries(server, &args, &reply); !ok {
+							continue
+						}
+						rf.mu.Lock()
+						// find higher term, convert to follower
+						if reply.Term > rf.currentTerm {
+							DPrintf("[%v] find a new higher term and convert to follower", rf.me)
 
-			// follower's log is later than leader
-			//if !reply.Success && reply.XIndex != -1 {
-			//	rf.nextIndex[server] = reply.XIndex
-			//	rf.matchIndex[server] = reply.XIndex - 1
-			//
-			//	// start appendEntries
-			//	//go func(sv int) {
-			//	//	for {
-			//	//		rf.mu.Lock()
-			//	//		args := AppendEntriesArgs{
-			//	//			Term:         currentTerm,
-			//	//			LeaderId:     rf.me,
-			//	//			PrevLogIndex: prevLogIndex,
-			//	//			PrevLogTerm:  prevLogTerm,
-			//	//			LeaderCommit: leaderCommit,
-			//	//		}
-			//	//		nextIndex := rf.myNextIndex
-			//	//		tmpIndex := rf.nextIndex[sv]
-			//	//
-			//	//		// appendEntries() only if have new Entries
-			//	//		if rf.nextIndex[sv] < nextIndex {
-			//	//			args.Entries = rf.log[rf.nextIndex[sv]:nextIndex]
-			//	//		}
-			//	//		reply := AppendEntriesReply{}
-			//	//
-			//	//		if rf.killed() || rf.state != Leader {
-			//	//			rf.mu.Unlock()
-			//	//			return
-			//	//		}
-			//	//		rf.mu.Unlock()
-			//	//
-			//	//		DPrintf("[%v] leader send appendEntries to [%v] : %v", rf.me, sv, args)
-			//	//		if ok := rf.sendAppendEntries(sv, &args, &reply); !ok && len(args.Entries) > 0 {
-			//	//			// maybe the peer crash, we should retry if necessary（have new entries)
-			//	//			continue
-			//	//		}
-			//	//
-			//	//		rf.mu.Lock()
-			//	//		// find higher term, convert to follower
-			//	//		if reply.Term > rf.currentTerm {
-			//	//			DPrintf("[%v] find a new higher term and convert to follower", rf.me)
-			//	//
-			//	//			rf.currentTerm = reply.Term
-			//	//			rf.state = Follower
-			//	//			rf.votedFor = -1
-			//	//			//rf.electionTimer.Reset(getElectionTimeout())
-			//	//			rf.mu.Unlock()
-			//	//
-			//	//			return
-			//	//		}
-			//	//		rf.mu.Unlock()
-			//	//
-			//	//		if reply.Success {
-			//	//			rf.mu.Lock()
-			//	//			// defend another later heartbeat change it
-			//	//			if rf.nextIndex[server] == tmpIndex {
-			//	//				rf.nextIndex[server] = nextIndex
-			//	//				rf.matchIndex[server] = nextIndex - 1
-			//	//			}
-			//	//			rf.mu.Unlock()
-			//	//			return
-			//	//		} else {
-			//	//			rf.mu.Lock()
-			//	//			// decrement the nextIndex and retry AppendEntries()
-			//	//			if reply.XTerm != -1 {
-			//	//				rf.nextIndex[server] = reply.XIndex
-			//	//				// todo
-			//	//				rf.matchIndex[server] = reply.XIndex - 1
-			//	//			}
-			//	//			rf.mu.Unlock()
-			//	//		}
-			//	//	}
-			//	//}(server)
-			//}
+							rf.currentTerm = reply.Term
+							rf.state = Follower
+							rf.votedFor = -1
+							//rf.electionTimer.Reset(getElectionTimeout())
+							rf.mu.Unlock()
+
+							return
+						}
+						rf.mu.Unlock()
+
+						if reply.Success {
+							rf.mu.Lock()
+							rf.nextIndex[server] = rf.myNextIndex
+							rf.matchIndex[server] = rf.myNextIndex - 1
+							rf.mu.Unlock()
+
+							return
+						} else {
+							rf.mu.Lock()
+
+							// decrement the nextIndex and retry AppendEntries()
+							if reply.XTerm != -1 {
+								rf.nextIndex[server] = reply.XIndex
+								// todo
+								rf.matchIndex[server] = reply.XIndex - 1
+							}
+
+							rf.mu.Unlock()
+						}
+					}
+				}()
+			}
 			rf.mu.Unlock()
 		}(idx)
 	}
@@ -855,9 +839,8 @@ func (rf *Raft) leaderAppendEntries() {
 					rf.mu.Lock()
 
 					// decrement the nextIndex and retry AppendEntries()
-					if reply.XTerm != -1 {
+					if reply.XIndex > 1 {
 						rf.nextIndex[server] = reply.XIndex
-						// todo
 						rf.matchIndex[server] = reply.XIndex - 1
 					}
 

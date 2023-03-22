@@ -305,6 +305,7 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(106, servers, true)
 	time.Sleep(RaftElectionTimeout)
 	cfg.one(107, servers, true)
+	time.Sleep(RaftElectionTimeout)
 
 	cfg.end()
 }

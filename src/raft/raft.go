@@ -197,20 +197,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// restriction
-	if rf.myNextIndex > 1 {
-		lastLogTerm := rf.log[rf.myNextIndex-1].Term
-		if lastLogTerm == args.LastLogTerm {
-			if rf.myNextIndex-1 > args.LastLogIndex {
-				reply.VoteGranted = false
-				reply.Term = rf.currentTerm
-				return
-			}
-		} else if lastLogTerm > args.LastLogTerm {
+	// vote restriction
+	lastLogTerm := rf.log[rf.myNextIndex-1].Term
+	if lastLogTerm == args.LastLogTerm {
+		if rf.myNextIndex-1 > args.LastLogIndex {
 			reply.VoteGranted = false
 			reply.Term = rf.currentTerm
 			return
 		}
+	} else if lastLogTerm > args.LastLogTerm {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
 	}
 
 	// grant vote and reset election timeout
@@ -411,8 +409,8 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) killed() bool {
-	//z := atomic.LoadInt32(&rf.dead)
-	return false
+	z := atomic.LoadInt32(&rf.dead)
+	return z == 1
 }
 
 func (rf *Raft) ticker() {
@@ -434,10 +432,7 @@ func (rf *Raft) ticker() {
 
 			DPrintf("[%v] election timeout, start new election", rf.me)
 			rf.newElection()
-			rf.electionTimer.Reset(getElectionTimeout())
-			//case <-testTimer.C:
-			//	DPrintf("[%v] still waiting for election timeout", rf.me)
-			//	testTimer.Reset(300 * time.Millisecond)
+			//rf.electionTimer.Reset(getElectionTimeout())
 		}
 	}
 	DPrintf("error!!!!!!!")
@@ -710,7 +705,7 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 					}
 					rf.mu.Lock()
 					// defend another later heartbeat change it
-					if nextIndex > rf.nextIndex[server] {
+					if rf.nextIndex[server] < nextIndex {
 						rf.nextIndex[server] = nextIndex
 						rf.matchIndex[server] = nextIndex - 1
 					}
@@ -740,15 +735,19 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 			}
 		}(idx)
 	}
-	rf.mu.Lock()
-	// waiting for majority follower ack the appendEntries
-	if !isMajorityAgree.Load() {
-		cond.Wait()
-	}
 	if !isHeartBeat {
 		DPrintf("[%v] leader success append entries to majority followers", rf.me)
+
+		rf.mu.Lock()
+		// waiting for majority follower ack the appendEntries
+		if !isMajorityAgree.Load() {
+			cond.Wait()
+		}
+		rf.mu.Unlock()
 	}
-	// update commitIndex
+
+	rf.mu.Lock()
+	// check matchIndex and update commitIndex
 	for idx := rf.myNextIndex - 1; idx > rf.commitIndex; idx-- {
 		count := 1
 		if rf.log[idx].Term == rf.currentTerm {

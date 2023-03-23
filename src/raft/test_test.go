@@ -321,8 +321,11 @@ func TestFailNoAgree2B(t *testing.T) {
 
 	// 3 of 5 followers disconnect
 	leader := cfg.checkOneLeader()
+	DPrintf("follower [%v] disconnected", (leader+1)%servers)
 	cfg.disconnect((leader + 1) % servers)
+	DPrintf("follower [%v] disconnected", (leader+2)%servers)
 	cfg.disconnect((leader + 2) % servers)
+	DPrintf("follower [%v] disconnected", (leader+3)%servers)
 	cfg.disconnect((leader + 3) % servers)
 
 	index, _, ok := cfg.rafts[leader].Start(20)
@@ -341,8 +344,11 @@ func TestFailNoAgree2B(t *testing.T) {
 	}
 
 	// repair
+	DPrintf("follower [%v] reconnected", (leader+1)%servers)
 	cfg.connect((leader + 1) % servers)
+	DPrintf("follower [%v] reconnected", (leader+2)%servers)
 	cfg.connect((leader + 2) % servers)
+	DPrintf("follower [%v] reconnected", (leader+3)%servers)
 	cfg.connect((leader + 3) % servers)
 
 	// the disconnected majority may have chosen a leader from

@@ -80,6 +80,7 @@ type Raft struct {
 	matchIndex  []int      // maintained with AppendEntries()
 	applyCh     chan ApplyMsg
 	replicateCh []chan AppendEntriesArgs
+	applierCh   chan bool
 }
 
 // return currentTerm and whether this server
@@ -307,20 +308,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// append entries
+	// append / modify  entries
 	for i, entry := range args.Entries {
 		index := args.PrevLogIndex + i + 1
 		if index >= rf.myNextIndex {
 			rf.log = append(rf.log, entry)
 			rf.myNextIndex++
-		} else if rf.log[index].Term != entry.Term {
+		} else {
 			rf.log = rf.log[:index]
 			rf.log = append(rf.log, entry)
 			rf.myNextIndex = index + 1
 		}
 	}
 
-	// check commitIndex and reply the entry
+	// check commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		// commit entry and reset commitIndex
 		if args.LeaderCommit < rf.myNextIndex {
@@ -330,17 +331,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		DPrintf("[%v] follower commitIndex change to %v", rf.me, rf.commitIndex)
 	}
+
 	// send applyMsg to kv server
-	for rf.lastApplied < rf.commitIndex {
-		rf.lastApplied++
-		applyMsg := ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[rf.lastApplied].Command,
-			CommandIndex: rf.lastApplied,
-		}
-		DPrintf("[%v] follower apply %v", rf.me, applyMsg)
-		DPrintf("[%v] follower log is %v", rf.me, rf.log)
-		rf.applyCh <- applyMsg
+	if rf.lastApplied < rf.commitIndex {
+		rf.applierCh <- true
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -436,6 +430,27 @@ func (rf *Raft) ticker() {
 		}
 	}
 	DPrintf("error!!!!!!!")
+}
+
+func (rf *Raft) applier() {
+	for {
+		select {
+		case <-rf.applierCh:
+			rf.mu.Lock()
+			for rf.lastApplied < rf.commitIndex {
+				rf.lastApplied++
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[rf.lastApplied].Command,
+					CommandIndex: rf.lastApplied,
+				}
+				DPrintf("[%v] follower apply %v", rf.me, applyMsg)
+				DPrintf("[%v] follower log is %v", rf.me, rf.log)
+				rf.applyCh <- applyMsg
+			}
+			rf.mu.Unlock()
+		}
+	}
 }
 
 // start a new election
@@ -569,10 +584,6 @@ func getElectionTimeout() time.Duration {
 // control the leader's heartbeat cycle
 func (rf *Raft) heartbeat() {
 
-	// todo : the bug which wasted my two days, no buffer channel
-	//DoneCh := make(chan bool)
-	//DoneCh := make(chan bool, 1)
-
 	// initialized heartbeat
 	go rf.doAppendEntries(true)
 	//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
@@ -622,16 +633,6 @@ func (rf *Raft) heartbeat() {
 	rf.mu.Unlock()
 }
 
-//// a goroutine use to handle heartbeat or AppendEntries() for a peer (1 to 1)
-//func (rf *Raft) replicator(peer int) {
-//	for {
-//		select {
-//		case args := <- rf.replicateCh[peer]:
-//
-//		}
-//	}
-//}
-
 // the real logic of heartbeat: send AppendEntries() to each peer if become leader
 func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 
@@ -674,9 +675,6 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				}
 				rf.mu.Unlock()
 
-				//if len(args.Entries) > 0 {
-				//	DPrintf("[%v] leader send appendEntries to [%v] : %v", rf.me, server, args)
-				//}
 				if ok := rf.sendAppendEntries(server, &args, &reply); !ok && len(args.Entries) > 0 {
 					// maybe the peer crash, we should retry if necessary（have new entries)
 					continue
@@ -690,7 +688,6 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
-					//rf.electionTimer.Reset(getElectionTimeout())
 					rf.mu.Unlock()
 
 					return
@@ -735,6 +732,7 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 			}
 		}(idx)
 	}
+	// we should wait for majority agree for the new entries if AppendEntries()
 	if !isHeartBeat {
 		DPrintf("[%v] leader success append entries to majority followers", rf.me)
 
@@ -747,7 +745,12 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 	}
 
 	rf.mu.Lock()
-	// check matchIndex and update commitIndex
+
+	if rf.killed() || rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	// check matchIndex and update commitIndex only we remain the leader
 	for idx := rf.myNextIndex - 1; idx > rf.commitIndex; idx-- {
 		count := 1
 		if rf.log[idx].Term == rf.currentTerm {
@@ -759,17 +762,8 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 		}
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = idx
-			for rf.lastApplied < rf.commitIndex {
-				rf.lastApplied++
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[rf.lastApplied].Command,
-					CommandIndex: rf.lastApplied,
-				}
-
-				DPrintf("[%v] leader apply %v", rf.me, applyMsg)
-				// send appMsg
-				rf.applyCh <- applyMsg
+			if rf.lastApplied < rf.commitIndex {
+				rf.applierCh <- true
 			}
 			DPrintf("[%v] leader commitIndex is %v", rf.me, idx)
 
@@ -813,12 +807,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
 	rf.replicateCh = make([]chan AppendEntriesArgs, len(peers))
+	rf.applierCh = make(chan bool, 1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
-	go rf.ticker()
+	go rf.ticker() // start applier goroutine to listen apply entries
+	go rf.applier()
 
 	return rf
 }

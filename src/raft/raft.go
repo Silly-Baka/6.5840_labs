@@ -262,9 +262,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	reply.XIndex = 0
-	reply.XTerm = 0
-
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -284,17 +281,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 2B
 	// have no entry in prevLogIndex or find conflicting log
-	if args.PrevLogIndex > rf.myNextIndex-1 || args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= rf.myNextIndex || args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 
 		// have no entry in prevLogIndex
-		if args.PrevLogIndex > rf.myNextIndex-1 {
+		if args.PrevLogIndex >= rf.myNextIndex {
 			reply.XTerm = -1
 			reply.XIndex = rf.myNextIndex
 		} else {
 			// delete the conflicting log
 			xTerm := rf.log[args.PrevLogIndex].Term
-			xIndex := args.PrevLogIndex
+			xIndex := args.PrevLogIndex - 1
 			// can change to use binarySearch
 			for xIndex > 0 && rf.log[xIndex].Term == xTerm {
 				xIndex--
@@ -304,6 +301,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = xTerm
 			reply.XIndex = xIndex + 1
 		}
+		DPrintf("[%v] follower's xIndex is %v", rf.me, reply.XIndex)
 
 		return
 	}
@@ -315,6 +313,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, entry)
 			rf.myNextIndex++
 		} else {
+			// duplicate the conflicting log
 			rf.log = rf.log[:index]
 			rf.log = append(rf.log, entry)
 			rf.myNextIndex = index + 1
@@ -429,24 +428,28 @@ func (rf *Raft) ticker() {
 			//rf.electionTimer.Reset(getElectionTimeout())
 		}
 	}
-	DPrintf("error!!!!!!!")
+	DPrintf("[%v] leader is dead", rf.me)
 }
 
 func (rf *Raft) applier() {
-	for {
+	for !rf.killed() {
 		select {
 		case <-rf.applierCh:
 			rf.mu.Lock()
-			for rf.lastApplied < rf.commitIndex {
-				rf.lastApplied++
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[rf.lastApplied].Command,
-					CommandIndex: rf.lastApplied,
+			if rf.lastApplied < rf.commitIndex {
+				idx := rf.lastApplied
+				entries := append(make([]LogEntry, 0), rf.log[rf.lastApplied+1:rf.commitIndex+1]...)
+				rf.lastApplied = rf.commitIndex
+				rf.mu.Unlock()
+				for i, entry := range entries {
+					applyMsg := ApplyMsg{
+						CommandValid: true,
+						Command:      entry.Command,
+						CommandIndex: idx + i + 1,
+					}
+					rf.applyCh <- applyMsg
 				}
-				DPrintf("[%v] follower apply %v", rf.me, applyMsg)
-				DPrintf("[%v] follower log is %v", rf.me, rf.log)
-				rf.applyCh <- applyMsg
+				break
 			}
 			rf.mu.Unlock()
 		}
@@ -560,7 +563,7 @@ func (rf *Raft) newElection() {
 
 			rf.mu.Unlock()
 
-			DPrintf("[%v] become leader", rf.me)
+			DPrintf("[%v] become leader, cur log is %v", rf.me, rf.log)
 			go rf.heartbeat()
 
 			break
@@ -657,14 +660,15 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				args := AppendEntriesArgs{
 					Term:         currentTerm,
 					LeaderId:     rf.me,
-					PrevLogIndex: rf.nextIndex[server] - 1,
-					PrevLogTerm:  rf.log[rf.nextIndex[server]-1].Term,
 					LeaderCommit: leaderCommit,
 				}
 				nextIndex := rf.myNextIndex
 
+				args.PrevLogIndex = rf.nextIndex[server] - 1
+				args.PrevLogTerm = rf.log[rf.nextIndex[server]-1].Term
+
 				// appendEntries() if have new Entries
-				if rf.nextIndex[server] < nextIndex {
+				if rf.nextIndex[server] < rf.myNextIndex {
 					args.Entries = rf.log[rf.nextIndex[server]:]
 				}
 				reply := AppendEntriesReply{}
@@ -675,9 +679,9 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				}
 				rf.mu.Unlock()
 
-				if ok := rf.sendAppendEntries(server, &args, &reply); !ok && len(args.Entries) > 0 {
-					// maybe the peer crash, we should retry if necessary（have new entries)
-					continue
+				if ok := rf.sendAppendEntries(server, &args, &reply); !ok {
+					// maybe the peer crash, we should retry
+					return
 				}
 
 				rf.mu.Lock()
@@ -694,17 +698,21 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				}
 				rf.mu.Unlock()
 
+				DPrintf("[%v] peer %v reply is %v", rf.me, server, reply)
 				if reply.Success {
 					successCount.Add(1)
 					if int(successCount.Load()) > len(rf.peers)/2 {
 						isMajorityAgree.Store(true)
-						cond.Broadcast()
+						if !isHeartBeat {
+							cond.Broadcast()
+						}
 					}
 					rf.mu.Lock()
 					// defend another later heartbeat change it
 					if rf.nextIndex[server] < nextIndex {
 						rf.nextIndex[server] = nextIndex
 						rf.matchIndex[server] = nextIndex - 1
+						DPrintf("follower [%v] nextIndex update to %v", server, nextIndex)
 					}
 					rf.mu.Unlock()
 
@@ -712,12 +720,14 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				} else {
 					rf.mu.Lock()
 
-					index := 0
+					DPrintf("[%v] follower %v refuse, xTerm is %v, xIndex is %v", rf.me, server, reply.XTerm, reply.XIndex)
+					index := -1
 					found := false
 					for i, entry := range rf.log {
 						if entry.Term == reply.XTerm {
 							index = i
 							found = true
+						} else if found {
 							break
 						}
 					}
@@ -807,7 +817,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
 	rf.replicateCh = make([]chan AppendEntriesArgs, len(peers))
-	rf.applierCh = make(chan bool, 1)
+	rf.applierCh = make(chan bool, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())

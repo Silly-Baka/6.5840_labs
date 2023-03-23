@@ -243,6 +243,7 @@ func TestLeaderFailure2B(t *testing.T) {
 
 	// disconnect the first leader.
 	leader1 := cfg.checkOneLeader()
+	DPrintf("leader %v was disconnected", leader1)
 	cfg.disconnect(leader1)
 
 	// the remaining followers should elect
@@ -253,6 +254,7 @@ func TestLeaderFailure2B(t *testing.T) {
 
 	// disconnect the new leader.
 	leader2 := cfg.checkOneLeader()
+	DPrintf("leader %v was disconnected", leader2)
 	cfg.disconnect(leader2)
 
 	// submit a command to each server.

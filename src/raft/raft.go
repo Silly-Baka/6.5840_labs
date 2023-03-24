@@ -47,7 +47,6 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
-// todo 尚未完善的Entry定义
 type LogEntry struct {
 	Term    int         // the term when receive the command
 	Command interface{} // command
@@ -262,6 +261,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	reply.XIndex = 1
+	reply.XTerm = 1
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -425,7 +426,6 @@ func (rf *Raft) ticker() {
 
 			DPrintf("[%v] election timeout, start new election", rf.me)
 			rf.newElection()
-			//rf.electionTimer.Reset(getElectionTimeout())
 		}
 	}
 	DPrintf("[%v] leader is dead", rf.me)
@@ -466,9 +466,6 @@ func (rf *Raft) newElection() {
 	// vote for self
 	rf.votedFor = rf.me
 
-	//if !rf.electionTimer.Stop() {
-	//	<-rf.electionTimer.C
-	//}
 	rf.electionTimer.Reset(getElectionTimeout())
 
 	args := RequestVoteArgs{
@@ -516,18 +513,11 @@ func (rf *Raft) newElection() {
 				rf.currentTerm = reply.Term
 				rf.state = Follower
 				rf.votedFor = -1
-				//rf.electionTimer.Reset(getElectionTimeout())
 
-				// todo
 				voteCh <- false
 				return
 			}
 
-			if reply.VoteGranted {
-				//DPrintf("[%v] success get vote from [%v]", rf.me, server)
-			} else {
-				//DPrintf("[%v] failed to get vote from [%v]", rf.me, server)
-			}
 			voteCh <- reply.VoteGranted
 		}(idx)
 	}
@@ -721,22 +711,9 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 					rf.mu.Lock()
 
 					DPrintf("[%v] follower %v refuse, xTerm is %v, xIndex is %v", rf.me, server, reply.XTerm, reply.XIndex)
-					index := -1
-					found := false
-					for i, entry := range rf.log {
-						if entry.Term == reply.XTerm {
-							index = i
-							found = true
-						} else if found {
-							break
-						}
-					}
-					if found {
-						rf.nextIndex[server] = index + 1
-					} else {
-						rf.nextIndex[server] = reply.XIndex
-					}
-					//DPrintf("[%v] %v's nextIndex is %v", rf.me, server, rf.nextIndex[server])
+					rf.nextIndex[server] = reply.XIndex
+
+					DPrintf("[%v] %v's nextIndex is %v", rf.me, server, rf.nextIndex[server])
 					rf.mu.Unlock()
 				}
 			}
@@ -816,7 +793,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
-	rf.replicateCh = make([]chan AppendEntriesArgs, len(peers))
+	//rf.replicateCh = make([]chan AppendEntriesArgs, len(peers))
 	rf.applierCh = make(chan bool, 100)
 
 	// initialize from state persisted before a crash

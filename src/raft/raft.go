@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -80,6 +82,7 @@ type Raft struct {
 	applyCh     chan ApplyMsg
 	replicateCh []chan AppendEntriesArgs
 	applierCh   chan bool
+	persisterCh chan bool
 }
 
 // return currentTerm and whether this server
@@ -111,13 +114,20 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	buf := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buf)
+
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+
+	raftState := buf.Bytes()
+	rf.persister.Save(raftState, nil)
+
+	DPrintf("[%v] persist success", rf.me)
 }
 
 // restore previously persisted state.
@@ -126,18 +136,27 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	decoder := labgob.NewDecoder(bytes.NewReader(data))
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+
+	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&log) != nil {
+
+		DPrintf("[%v] failed to crash recovery", rf.me)
+		return
+
+	}
+	rf.mu.Lock()
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = log
+	rf.myNextIndex = len(log)
+
+	rf.mu.Unlock()
 }
 
 // the service says it has created a snapshot that has
@@ -216,6 +235,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	reply.Term = rf.currentTerm
 
+	// store the state
+	rf.persisterCh <- true
+
 	rf.electionTimer.Reset(getElectionTimeout())
 
 	//DPrintf("[%v] success to vote for [%v]", rf.me, args.CandidateId)
@@ -275,6 +297,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.state = Follower
 		DPrintf("[%v] find a new higher term and convert to follower", rf.me)
+
+		rf.persisterCh <- true
 	}
 	rf.electionTimer.Reset(getElectionTimeout())
 
@@ -301,6 +325,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = rf.log[:xIndex+1]
 			reply.XTerm = xTerm
 			reply.XIndex = xIndex + 1
+
+			rf.persisterCh <- true
 		}
 		DPrintf("[%v] follower's xIndex is %v", rf.me, reply.XIndex)
 
@@ -320,6 +346,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.myNextIndex = index + 1
 		}
 	}
+	rf.persisterCh <- true
 
 	// check commitIndex
 	if args.LeaderCommit > rf.commitIndex {
@@ -378,6 +405,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
 	rf.myNextIndex++
+
+	rf.persisterCh <- true
 	rf.mu.Unlock()
 
 	DPrintf("[%v] leader start new command, index is %v", rf.me, index)
@@ -425,7 +454,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 			DPrintf("[%v] election timeout, start new election", rf.me)
-			rf.newElection()
+			rf.NewElection()
 		}
 	}
 	DPrintf("[%v] leader is dead", rf.me)
@@ -440,6 +469,9 @@ func (rf *Raft) applier() {
 				idx := rf.lastApplied
 				entries := append(make([]LogEntry, 0), rf.log[rf.lastApplied+1:rf.commitIndex+1]...)
 				rf.lastApplied = rf.commitIndex
+
+				DPrintf("[%v] apply to index [%v]", rf.me, rf.lastApplied)
+				DPrintf("[%v] cur log is %v", rf.me, rf.log)
 				rf.mu.Unlock()
 				for i, entry := range entries {
 					applyMsg := ApplyMsg{
@@ -456,8 +488,18 @@ func (rf *Raft) applier() {
 	}
 }
 
+// the goroutine that responsible for background persistence
+func (rf *Raft) Persister() {
+	for !rf.killed() {
+		select {
+		case <-rf.persisterCh:
+			rf.persist()
+		}
+	}
+}
+
 // start a new election
-func (rf *Raft) newElection() {
+func (rf *Raft) NewElection() {
 	// reset election timeout
 
 	rf.mu.Lock()
@@ -465,6 +507,8 @@ func (rf *Raft) newElection() {
 
 	// vote for self
 	rf.votedFor = rf.me
+
+	rf.persisterCh <- true
 
 	rf.electionTimer.Reset(getElectionTimeout())
 
@@ -515,6 +559,7 @@ func (rf *Raft) newElection() {
 				rf.votedFor = -1
 
 				voteCh <- false
+				rf.persisterCh <- true
 				return
 			}
 
@@ -691,6 +736,8 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 					rf.currentTerm = reply.Term
 					rf.state = Follower
 					rf.votedFor = -1
+
+					rf.persisterCh <- true
 					rf.mu.Unlock()
 
 					return
@@ -805,12 +852,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//rf.replicateCh = make([]chan AppendEntriesArgs, len(peers))
 	rf.applierCh = make(chan bool, 100)
 
+	// 2C
 	// initialize from state persisted before a crash
+	rf.persisterCh = make(chan bool, 100)
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker() // start applier goroutine to listen apply entries
 	go rf.applier()
+	go rf.Persister()
 
 	return rf
 }

@@ -171,14 +171,14 @@ func (cfg *config) ShutdownServer(gi int, i int) {
 
 	// disable client connections to the server.
 	// it's important to do this before creating
-	// the new Persister in saved[i], to avoid
+	// the new Persist in saved[i], to avoid
 	// the possibility of the server returning a
 	// positive reply to an Append but persisting
-	// the result in the superseded Persister.
+	// the result in the superseded Persist.
 	cfg.net.DeleteServer(cfg.servername(gg.gid, i))
 
 	// a fresh persister, in case old instance
-	// continues to update the Persister.
+	// continues to update the Persist.
 	// but copy old persister's content so that we always
 	// pass Make() the last persisted state.
 	if gg.saved[i] != nil {

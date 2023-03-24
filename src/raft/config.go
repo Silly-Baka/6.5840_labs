@@ -114,7 +114,7 @@ func (cfg *config) crash1(i int) {
 	defer cfg.mu.Unlock()
 
 	// a fresh persister, in case old instance
-	// continues to update the Persister.
+	// continues to update the Persist.
 	// but copy old persister's content so that we always
 	// pass Make() the last persisted state.
 	if cfg.saved[i] != nil {

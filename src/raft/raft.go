@@ -657,6 +657,8 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				args.PrevLogIndex = rf.nextIndex[server] - 1
 				args.PrevLogTerm = rf.log[rf.nextIndex[server]-1].Term
 
+				tmpTerm := rf.currentTerm
+
 				// appendEntries() if have new Entries
 				if rf.nextIndex[server] < rf.myNextIndex {
 					args.Entries = rf.log[rf.nextIndex[server]:]
@@ -675,6 +677,13 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				}
 
 				rf.mu.Lock()
+
+				// throw the overdue reply
+				if rf.currentTerm != tmpTerm {
+					rf.mu.Unlock()
+					return
+				}
+
 				// find higher term, convert to follower
 				if reply.Term > rf.currentTerm {
 					//DPrintf("[%v] find a new higher term and convert to follower", rf.me)

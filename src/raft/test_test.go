@@ -523,6 +523,9 @@ func TestBackup2B(t *testing.T) {
 
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
+	DPrintf("follower %v was disconnected", (leader1+2)%servers)
+	DPrintf("follower %v was disconnected", (leader1+3)%servers)
+	DPrintf("follower %v was disconnected", (leader1+4)%servers)
 	cfg.disconnect((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
@@ -534,10 +537,15 @@ func TestBackup2B(t *testing.T) {
 
 	time.Sleep(RaftElectionTimeout / 2)
 
+	DPrintf("%v was disconnected", (leader1+0)%servers)
+	DPrintf("%v was disconnected", (leader1+1)%servers)
 	cfg.disconnect((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
 
 	// allow other partition to recover
+	DPrintf("%v was connected", (leader1+2)%servers)
+	DPrintf("%v was connected", (leader1+3)%servers)
+	DPrintf("%v was connected", (leader1+4)%servers)
 	cfg.connect((leader1 + 2) % servers)
 	cfg.connect((leader1 + 3) % servers)
 	cfg.connect((leader1 + 4) % servers)
@@ -553,6 +561,7 @@ func TestBackup2B(t *testing.T) {
 	if leader2 == other {
 		other = (leader2 + 1) % servers
 	}
+	DPrintf("%v was disconnected", other)
 	cfg.disconnect(other)
 
 	// lots more commands that won't commit
@@ -564,8 +573,12 @@ func TestBackup2B(t *testing.T) {
 
 	// bring original leader back to life,
 	for i := 0; i < servers; i++ {
+		DPrintf("%v was disconnected", i)
 		cfg.disconnect(i)
 	}
+	DPrintf("%v was connected", (leader1+0)%servers)
+	DPrintf("%v was connected", (leader1+1)%servers)
+	DPrintf("%v was connected", other)
 	cfg.connect((leader1 + 0) % servers)
 	cfg.connect((leader1 + 1) % servers)
 	cfg.connect(other)
@@ -577,6 +590,7 @@ func TestBackup2B(t *testing.T) {
 
 	// now everyone
 	for i := 0; i < servers; i++ {
+		DPrintf("%v was connected", i)
 		cfg.connect(i)
 	}
 	cfg.one(rand.Int(), servers, true)

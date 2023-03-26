@@ -7,5 +7,5 @@ const (
 	Candidate = 0x2
 	Leader    = 0x3
 
-	HeartBeatTimeout = time.Duration(120) * time.Millisecond
+	HeartBeatTimeout = time.Duration(100) * time.Millisecond
 )

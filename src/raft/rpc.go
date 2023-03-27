@@ -17,3 +17,15 @@ type AppendEntriesReply struct {
 	XTerm   int // the term of conflicting log , -1 if no conflict
 	XIndex  int // the first index of XTerm, -1 if no conflict
 }
+
+// InstallSnapshot()
+type InstallSnapshotArgs struct {
+	Term              int // the term of follower
+	LeaderId          int
+	LastIncludedIndex int    // the last log index included in the snapshot
+	LastIncludedTerm  int    // the last log term included in the snapshot
+	Snapshot          []byte // the snapshot which stored in leader
+}
+type InstallSnapshotReply struct {
+	Term int // the term of this peer
+}

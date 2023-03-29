@@ -1284,12 +1284,14 @@ func TestSnapshotInit2D(t *testing.T) {
 
 	// crash all
 	for i := 0; i < servers; i++ {
+		DPrintf("[%v] was crashed", i)
 		cfg.crash1(i)
 	}
 
 	// revive all
 	for i := 0; i < servers; i++ {
 		cfg.start1(i, cfg.applierSnap)
+		DPrintf("[%v] was connected", i)
 		cfg.connect(i)
 	}
 
@@ -1298,12 +1300,14 @@ func TestSnapshotInit2D(t *testing.T) {
 
 	// crash all
 	for i := 0; i < servers; i++ {
+		DPrintf("[%v] was crashed", i)
 		cfg.crash1(i)
 	}
 
 	// revive all
 	for i := 0; i < servers; i++ {
 		cfg.start1(i, cfg.applierSnap)
+		DPrintf("[%v] was connected", i)
 		cfg.connect(i)
 	}
 

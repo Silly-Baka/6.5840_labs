@@ -27,5 +27,6 @@ type InstallSnapshotArgs struct {
 	Snapshot          []byte // the snapshot which stored in leader
 }
 type InstallSnapshotReply struct {
-	Term int // the term of this peer
+	Term    int  // the term of this peer
+	Success bool // represent that the peer have accepted the snapshot or not
 }

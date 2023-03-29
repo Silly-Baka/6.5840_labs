@@ -341,13 +341,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	var lastLogTerm int
 	// vote restriction
-	if rf.logicNextIndex > 0 {
-		lastLogTerm = rf.log[rf.logicNextIndex-1].Term
-	} else {
-		lastLogTerm = rf.lastIncludedTerm
-	}
+	lastLogTerm := rf.log[rf.logicNextIndex-1].Term
 	if lastLogTerm == args.LastLogTerm {
 		if rf.realNextIndex-1 > args.LastLogIndex {
 			reply.VoteGranted = false
@@ -412,7 +407,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	//DPrintf("[%v] term %v ,cur log is %v, entries is %v", rf.me, rf.currentTerm, rf.log, args)
 
-	reply.XIndex = rf.lastIncludedIndex + 1
+	reply.XIndex = rf.lastIncludedIndex
 	reply.XTerm = 0
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -436,7 +431,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 2B
 	// have no entry in prevLogIndex or find conflicting log
 	preLogIndex := rf.realToLogic(args.PrevLogIndex)
-	if args.PrevLogIndex >= rf.realNextIndex || preLogIndex > 0 && rf.log[preLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= rf.realNextIndex || preLogIndex >= 0 && rf.log[preLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 
 		// have no entry in prevLogIndex
@@ -837,13 +832,6 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 	successCount.Store(1)
 	//isMajorityAgree := atomic.Bool{}
 
-	rf.mu.Lock()
-	appendEntriesArgs := AppendEntriesArgs{
-		Term:         currentTerm,
-		LeaderId:     rf.me,
-		LeaderCommit: leaderCommit,
-	}
-	rf.mu.Unlock()
 	// send appendEntries to each peer
 	for idx, _ := range rf.peers {
 		if idx == rf.me {
@@ -858,12 +846,18 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 				// distinguish AppendEntries() and InstallSnapshot()
 				if preLogIndex >= 0 {
 
+					appendEntriesArgs := AppendEntriesArgs{
+						Term:         currentTerm,
+						LeaderId:     rf.me,
+						LeaderCommit: leaderCommit,
+					}
+
 					appendEntriesArgs.PrevLogIndex = rf.nextIndex[server] - 1
 					appendEntriesArgs.PrevLogTerm = rf.log[preLogIndex].Term
 
 					// appendEntries() if have new Entries
 					if preLogIndex+1 < rf.logicNextIndex {
-						appendEntriesArgs.Entries = rf.log[preLogIndex+1 : rf.logicNextIndex]
+						appendEntriesArgs.Entries = rf.log[preLogIndex+1:]
 					}
 					reply := AppendEntriesReply{}
 
@@ -943,7 +937,31 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 						LastIncludedTerm:  rf.lastIncludedTerm,
 						Snapshot:          rf.snapshot,
 					}
-					rf.doInstallSnapshot(server, &installSnapshotArgs)
+					rf.mu.Unlock()
+
+					go func(server int) {
+						DPrintf("[%v] sending snapshot to [%v]", rf.me, server)
+						reply := InstallSnapshotReply{}
+						if ok := rf.sendInstallSnapshot(server, &installSnapshotArgs, &reply); !ok {
+							return
+						}
+						DPrintf("[%v] success doInstallSnapshot to [%v]", rf.me, server)
+						rf.mu.Lock()
+						defer rf.mu.Unlock()
+						// throw the overdue reply
+						if rf.currentTerm != installSnapshotArgs.Term || rf.state != Leader {
+							return
+						}
+						if reply.Term > rf.currentTerm {
+							rf.currentTerm = reply.Term
+							rf.state = Follower
+							rf.votedFor = -1
+							rf.electionTimer.Reset(getElectionTimeout())
+						}
+					}(server)
+
+					rf.mu.Lock()
+					rf.nextIndex[server] = rf.realNextIndex
 					rf.mu.Unlock()
 				}
 			}
@@ -993,33 +1011,6 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 			break
 		}
 	}
-	rf.mu.Unlock()
-}
-
-func (rf *Raft) doInstallSnapshot(peer int, args *InstallSnapshotArgs) {
-	// send Snapshot to server
-	go func(server int) {
-		DPrintf("[%v] sending snapshot to [%v]", rf.me, server)
-		reply := InstallSnapshotReply{}
-		if ok := rf.sendInstallSnapshot(server, args, &reply); !ok {
-			return
-		}
-		rf.mu.Lock()
-		// throw the overdue reply
-		if rf.currentTerm != args.Term || rf.state != Leader {
-			return
-		}
-		if reply.Term > rf.currentTerm {
-			rf.currentTerm = reply.Term
-			rf.state = Follower
-			rf.votedFor = -1
-			rf.electionTimer.Reset(getElectionTimeout())
-		}
-		rf.mu.Unlock()
-	}(peer)
-
-	rf.mu.Lock()
-	rf.nextIndex[peer] = rf.realNextIndex
 	rf.mu.Unlock()
 }
 

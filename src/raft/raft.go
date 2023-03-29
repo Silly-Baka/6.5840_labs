@@ -248,14 +248,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		DPrintf("[%v] get snapshot from leader [%v], lastInclude is [%v]", rf.me, args.LeaderId, args.LastIncludedIndex)
 		DPrintf("[%v] cur log is %v", rf.me, rf.log)
 
-		// apply snapshot to local state machine
-		applyMsg := ApplyMsg{
-			SnapshotValid: true,
-			Snapshot:      args.Snapshot,
-			SnapshotTerm:  args.LastIncludedTerm,
-			SnapshotIndex: args.LastIncludedIndex,
-		}
-		rf.applyBufferCh <- applyMsg
+		defer func() {
+			// apply snapshot to local state machine
+			applyMsg := ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      args.Snapshot,
+				SnapshotTerm:  args.LastIncludedTerm,
+				SnapshotIndex: args.LastIncludedIndex,
+			}
+			//rf.applyBufferCh <- applyMsg
+			rf.applyCh <- applyMsg
+		}()
 	}
 }
 
@@ -603,41 +606,41 @@ func (rf *Raft) ticker() {
 }
 
 // check and prepare the applyMsg to buffer
-func (rf *Raft) prepareApply() {
-	rf.mu.Lock()
-	if rf.lastApplied < rf.commitIndex {
-		idx := rf.lastApplied
-
-		lastApplied := rf.realToLogic(rf.lastApplied)
-		commitIndex := rf.realToLogic(rf.commitIndex)
-
-		// have been snapshot, do not need to apply
-		if lastApplied < 0 {
-			rf.mu.Unlock()
-			return
-		}
-
-		entries := append([]LogEntry{}, rf.log[lastApplied+1:commitIndex+1]...)
-		rf.lastApplied = rf.commitIndex
-
-		DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
-		DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
-		rf.mu.Unlock()
-
-		DPrintf("[%v] test deadlock", rf.me)
-
-		for i, entry := range entries {
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
-				CommandIndex: idx + i + 1,
-			}
-			rf.applyBufferCh <- applyMsg
-		}
-		return
-	}
-	rf.mu.Unlock()
-}
+//func (rf *Raft) prepareApply() {
+//	rf.mu.Lock()
+//	if rf.lastApplied < rf.commitIndex {
+//		idx := rf.lastApplied
+//
+//		lastApplied := rf.realToLogic(rf.lastApplied)
+//		commitIndex := rf.realToLogic(rf.commitIndex)
+//
+//		// have been snapshot, do not need to apply
+//		if lastApplied < 0 {
+//			rf.mu.Unlock()
+//			return
+//		}
+//
+//		entries := append([]LogEntry{}, rf.log[lastApplied+1:commitIndex+1]...)
+//		rf.lastApplied = rf.commitIndex
+//
+//		DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
+//		DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
+//		rf.mu.Unlock()
+//
+//		DPrintf("[%v] test deadlock", rf.me)
+//
+//		for i, entry := range entries {
+//			applyMsg := ApplyMsg{
+//				CommandValid: true,
+//				Command:      entry.Command,
+//				CommandIndex: idx + i + 1,
+//			}
+//			rf.applyBufferCh <- applyMsg
+//		}
+//		return
+//	}
+//	rf.mu.Unlock()
+//}
 
 // a goroutine that listen to the applyBufferCh and send applyMsg to applyCh
 func (rf *Raft) applier() {

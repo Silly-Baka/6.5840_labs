@@ -81,7 +81,7 @@ type Raft struct {
 	nextIndex      []int      // the next index of log will be sent to follower
 	matchIndex     []int      // maintained with AppendEntries()
 	applyCh        chan ApplyMsg
-	applierCh      chan bool
+	applyBufferCh  chan ApplyMsg // a buffer that store the applyMsg
 
 	// 2D
 	lastIncludedTerm  int
@@ -163,9 +163,6 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
-	//rf.snapshotMu.Lock()
-	//defer rf.snapshotMu.Unlock()
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -173,7 +170,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		panic("the snapshot error")
 	}
 	// ignore the repeated snapshot
-	if index == rf.lastIncludedIndex {
+	if index <= rf.lastIncludedIndex {
 		return
 	}
 	logicIndex := rf.realToLogic(index)
@@ -182,50 +179,9 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	rf.log = append([]LogEntry{{rf.lastIncludedTerm, nil}}, rf.log[logicIndex+1:]...)
 	rf.logicNextIndex = len(rf.log)
-
+	rf.snapshot = snapshot
 	DPrintf("[%v] snapshot last index is %v", rf.me, index)
 	DPrintf("[%v] cur log is %v", rf.me, rf.log)
-	rf.snapshot = snapshot
-
-	//if rf.state == Leader {
-	//	// check nextIndex and send Snapshot to peer
-	//	args := InstallSnapshotArgs{
-	//		Term:              rf.currentTerm,
-	//		LeaderId:          rf.me,
-	//		LastIncludedIndex: rf.lastIncludedIndex,
-	//		LastIncludedTerm:  rf.lastIncludedTerm,
-	//		Snapshot:          snapshot,
-	//	}
-	//
-	//	for peer := range rf.peers {
-	//		if peer == rf.me {
-	//			continue
-	//		}
-	//		if rf.nextIndex[peer] <= index {
-	//			go func(server int) {
-	//
-	//				DPrintf("[%v] sending snapshot to [%v]", rf.me, server)
-	//				reply := InstallSnapshotReply{}
-	//				if ok := rf.sendInstallSnapshot(server, &args, &reply); !ok {
-	//					return
-	//				}
-	//				rf.mu.Lock()
-	//				// throw the overdue reply
-	//				if rf.currentTerm != args.Term || rf.state != Leader {
-	//					return
-	//				}
-	//				if reply.Term > rf.currentTerm {
-	//					rf.currentTerm = reply.Term
-	//					rf.state = Follower
-	//					rf.votedFor = -1
-	//					rf.electionTimer.Reset(getElectionTimeout())
-	//				}
-	//				rf.mu.Unlock()
-	//			}(peer)
-	//			rf.nextIndex[peer] = rf.realNextIndex
-	//		}
-	//	}
-	//}
 }
 
 // Leader calls this to update Followers' state
@@ -250,6 +206,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	// replace the current snapshot
 	if args.LastIncludedIndex > rf.lastIncludedIndex || args.LastIncludedIndex >= rf.realNextIndex {
 		rf.snapshot = args.Snapshot
+		rf.lastIncludedIndex = args.LastIncludedIndex
+		rf.lastIncludedTerm = args.LastIncludedTerm
+		rf.realNextIndex = args.LastIncludedIndex + 1
+		rf.lastApplied = rf.lastIncludedIndex
+		rf.commitIndex = rf.lastIncludedIndex
 
 		// discard the log entries recovered by snapshot
 		lastIncludeIndex := rf.realToLogic(args.LastIncludedIndex)
@@ -262,11 +223,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			rf.log = []LogEntry{{rf.lastIncludedTerm, nil}}
 			rf.logicNextIndex = 1
 		}
-		rf.lastIncludedIndex = args.LastIncludedIndex
-		rf.lastIncludedTerm = args.LastIncludedTerm
-		rf.realNextIndex = args.LastIncludedIndex + 1
-		rf.lastApplied = rf.lastIncludedIndex
-		rf.commitIndex = rf.lastIncludedIndex
 
 		DPrintf("[%v] get snapshot from leader [%v], lastInclude is [%v]", rf.me, args.LeaderId, args.LastIncludedIndex)
 		DPrintf("[%v] cur log is %v", rf.me, rf.log)
@@ -278,7 +234,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
-		rf.applyCh <- applyMsg
+		go func() {
+			rf.applyCh <- applyMsg
+		}()
 	}
 	reply.Term = rf.currentTerm
 	rf.persist()
@@ -400,8 +358,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
-	//DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
-
+	DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -433,7 +390,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	preLogIndex := rf.realToLogic(args.PrevLogIndex)
 	if args.PrevLogIndex >= rf.realNextIndex || preLogIndex >= 0 && rf.log[preLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
-
+		DPrintf("[%v] heartbeat refuse and check", rf.me)
 		// have no entry in prevLogIndex
 		if args.PrevLogIndex >= rf.realNextIndex {
 			reply.XTerm = -1
@@ -453,13 +410,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XTerm = xTerm
 			reply.XIndex = rf.logicToReal(xIndex + 1)
 
+			DPrintf("[%v] heartbeat refuse and persist", rf.me)
 			rf.persist()
 		}
+		DPrintf("[%v] heartbeat send refuse", rf.me)
 		DPrintf("[%v] follower's xIndex is %v", rf.me, reply.XIndex)
 
 		return
 	}
 
+	DPrintf("[%v] heartbeat appendEntries", rf.me)
 	// append / modify  entries
 	for i, entry := range args.Entries {
 		index := args.PrevLogIndex + i + 1
@@ -479,8 +439,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
+	DPrintf("[%v] heartbeat persist", rf.me)
 	rf.persist()
 
+	DPrintf("[%v] heartbeat check commitIndex", rf.me)
 	// check commitIndex
 	if args.LeaderCommit > rf.commitIndex {
 		// commit entry and reset commitIndex
@@ -491,11 +453,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		DPrintf("[%v] follower commitIndex change to %v", rf.me, rf.commitIndex)
 
-		go func() {
-			rf.applierCh <- true
-		}()
+		// prepare applyMsg
+		go rf.prepareApply()
 	}
 
+	DPrintf("[%v] heartbeat reply", rf.me)
 	reply.Term = rf.currentTerm
 	reply.Success = true
 }
@@ -593,32 +555,38 @@ func (rf *Raft) ticker() {
 	DPrintf("[%v] leader is dead", rf.me)
 }
 
-func (rf *Raft) applier() {
-	for !rf.killed() {
-		select {
-		case <-rf.applierCh:
-			rf.mu.Lock()
-			if rf.lastApplied < rf.commitIndex {
-				idx := rf.lastApplied
-				entries := append([]LogEntry{}, rf.log[rf.realToLogic(rf.lastApplied+1):rf.realToLogic(rf.commitIndex+1)]...)
-				rf.lastApplied = rf.commitIndex
+// check and prepare the applyMsg to buffer
+func (rf *Raft) prepareApply() {
+	rf.mu.Lock()
+	if rf.lastApplied < rf.commitIndex {
+		idx := rf.lastApplied
+		entries := append([]LogEntry{}, rf.log[rf.realToLogic(rf.lastApplied+1):rf.realToLogic(rf.commitIndex+1)]...)
+		rf.lastApplied = rf.commitIndex
 
-				DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
-				DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
-				rf.mu.Unlock()
-				for i, entry := range entries {
-					applyMsg := ApplyMsg{
-						CommandValid: true,
-						Command:      entry.Command,
-						CommandIndex: idx + i + 1,
-					}
-					rf.applyCh <- applyMsg
-					DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
-				}
-			} else {
-				rf.mu.Unlock()
+		DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
+		DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
+		rf.mu.Unlock()
+
+		for i, entry := range entries {
+			applyMsg := ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: idx + i + 1,
 			}
+			rf.applyBufferCh <- applyMsg
 		}
+		return
+	}
+	rf.mu.Unlock()
+}
+
+// a goroutine that listen to the applyBufferCh and send applyMsg to applyCh
+func (rf *Raft) applier() {
+	for applyMsg := range rf.applyBufferCh {
+		if rf.killed() {
+			return
+		}
+		rf.applyCh <- applyMsg
 	}
 }
 
@@ -795,18 +763,6 @@ func (rf *Raft) heartbeat() {
 				go rf.doAppendEntries(true)
 
 				heartBeatTimer.Reset(HeartBeatTimeout)
-
-			case <-rf.doneCh:
-				rf.mu.Lock()
-				isDone = true
-				if !heartBeatTimer.Stop() {
-					<-heartBeatTimer.C
-				}
-				rf.mu.Unlock()
-
-				cond.Broadcast()
-
-				return
 			}
 		}
 	}()
@@ -840,6 +796,7 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 		go func(server int) {
 			for !rf.killed() && rf.state == Leader {
 
+				DPrintf("[%v] send heartbeat to [%v]", rf.me, server)
 				rf.mu.Lock()
 				preLogIndex := rf.realToLogic(rf.nextIndex[server] - 1)
 
@@ -871,6 +828,7 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 					DPrintf("[%v] appendEntries to [%v] is [%v]", rf.me, server, appendEntriesArgs)
 					if ok := rf.sendAppendEntries(server, &appendEntriesArgs, &reply); !ok {
 						// maybe the peer crash, we should retry
+						DPrintf("[%v] peer [%v] crash and have no reply", rf.me, server)
 						return
 					}
 
@@ -916,6 +874,8 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 						DPrintf("[%v] %v's nextIndex is %v", rf.me, server, rf.nextIndex[server])
 
 						rf.mu.Unlock()
+
+						DPrintf("[%v] test dead lock [%v]", rf.me, server)
 
 						return
 					} else {
@@ -963,6 +923,8 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 					rf.mu.Lock()
 					rf.nextIndex[server] = rf.realNextIndex
 					rf.mu.Unlock()
+
+					return
 				}
 			}
 		}(idx)
@@ -1003,9 +965,7 @@ func (rf *Raft) doAppendEntries(isHeartBeat bool) {
 		}
 		if count > len(rf.peers)/2 {
 			rf.commitIndex = idx
-			go func() {
-				rf.applierCh <- true
-			}()
+			go rf.prepareApply()
 			DPrintf("[%v] leader commitIndex is %v", rf.me, idx)
 
 			break
@@ -1049,7 +1009,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.applyCh = applyCh
-	rf.applierCh = make(chan bool, 1000)
 
 	// 2C
 	// initialize from state persisted before a crash
@@ -1058,6 +1017,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2D
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
+	rf.applyBufferCh = make(chan ApplyMsg, 10000)
 
 	// start ticker goroutine to start elections
 	go rf.ticker() // start applier goroutine to listen apply entries

@@ -20,6 +20,7 @@ package raft
 import (
 	"6.5840/labgob"
 	"bytes"
+	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -82,7 +83,6 @@ type Raft struct {
 	matchIndex     []int      // maintained with AppendEntries()
 	applyCh        chan ApplyMsg
 	applyBufferCh  chan ApplyMsg // a buffer that store the applyMsg
-	applierDoneCh  chan interface{}
 
 	// 2D
 	lastIncludedTerm  int
@@ -91,7 +91,7 @@ type Raft struct {
 
 	// rebuild
 	replicatorChPool []chan AppendEntriesArgs
-	doneChPool       []chan interface{} // the channel pool that control all replicator goroutine
+	doneChPool       map[string]chan interface{}
 }
 
 // return currentTerm and whether this server
@@ -260,7 +260,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
-		rf.applyBufferCh <- applyMsg
+		//rf.applyBufferCh <- applyMsg
+		rf.applyCh <- applyMsg
 	}
 }
 
@@ -541,8 +542,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					Command:      entry.Command,
 					CommandIndex: idx + i + 1,
 				}
-				rf.applyBufferCh <- applyMsg
-				//rf.applyCh <- applyMsg
+				//rf.applyBufferCh <- applyMsg
+				rf.applyCh <- applyMsg
 				DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
 			}
 		}
@@ -614,10 +615,11 @@ func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
 
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	for _, doneCh := range rf.doneChPool {
 		doneCh <- true
 	}
-	rf.applierDoneCh <- true
 }
 
 func (rf *Raft) killed() bool {
@@ -679,7 +681,8 @@ func (rf *Raft) prepareApply() {
 				Command:      entry.Command,
 				CommandIndex: idx + i + 1,
 			}
-			rf.applyBufferCh <- applyMsg
+			//rf.applyBufferCh <- applyMsg
+			rf.applyCh <- applyMsg
 		}
 		return
 	}
@@ -687,20 +690,20 @@ func (rf *Raft) prepareApply() {
 }
 
 // a goroutine that listen to the applyBufferCh and send applyMsg to applyCh
-func (rf *Raft) applier() {
-	defer func() {
-		close(rf.applierDoneCh)
-		close(rf.applyBufferCh)
-	}()
-	for !rf.killed() {
-		select {
-		case applyMsg := <-rf.applyBufferCh:
-			rf.applyCh <- applyMsg
-		case <-rf.applierDoneCh:
-			return
-		}
-	}
-}
+//func (rf *Raft) applier() {
+//	doneCh := rf.createDoneCh("applierCh")
+//	defer rf.deleteDoneCh("applierCh")
+//
+//	for {
+//		select {
+//		case applyMsg := <-rf.applyBufferCh:
+//			rf.applyCh <- applyMsg
+//
+//		case <-doneCh:
+//			return
+//		}
+//	}
+//}
 
 // start a new election
 func (rf *Raft) NewElection() {
@@ -838,7 +841,6 @@ func (rf *Raft) logicToReal(logicIndex int) int {
 
 // control the leader's heartbeat cycle
 func (rf *Raft) heartbeat() {
-
 	// initialized heartbeat
 	go rf.doDispatchRPC(true)
 	//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
@@ -846,6 +848,10 @@ func (rf *Raft) heartbeat() {
 	heartBeatTimer := time.NewTimer(HeartBeatTimeout)
 
 	go func() {
+		name := "heartbeatCh"
+		doneCh := rf.createDoneCh(name)
+		defer rf.deleteDoneCh(name)
+
 		for {
 			select {
 			case <-heartBeatTimer.C:
@@ -867,7 +873,7 @@ func (rf *Raft) heartbeat() {
 				go rf.doDispatchRPC(true)
 				heartBeatTimer.Reset(HeartBeatTimeout)
 
-			case <-rf.doneChPool[rf.me]:
+			case <-doneCh:
 				go func() {
 					if !heartBeatTimer.Stop() {
 						<-heartBeatTimer.C
@@ -1021,8 +1027,8 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 								Command:      entry.Command,
 								CommandIndex: cur + i + 1,
 							}
-							rf.applyBufferCh <- applyMsg
-							//rf.applyCh <- applyMsg
+							//rf.applyBufferCh <- applyMsg
+							rf.applyCh <- applyMsg
 							DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
 						}
 					}
@@ -1067,7 +1073,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.doneCh = make(chan bool, 1)
 	rf.replicatorChPool = make([]chan AppendEntriesArgs, len(peers))
-	rf.doneChPool = make([]chan interface{}, len(peers))
+	rf.doneChPool = make(map[string]chan interface{})
 
 	// 2B
 	rf.log = make([]LogEntry, 1)
@@ -1095,33 +1101,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	rf.InitReplicator()
 	go rf.ticker() // start applier goroutine to listen apply entries
-	go rf.applier()
+	//go rf.applier()
 
 	return rf
 }
 func (rf *Raft) InitReplicator() {
 	for peer := range rf.peers {
-		rf.replicatorChPool[peer] = make(chan AppendEntriesArgs)
-		rf.doneChPool[peer] = make(chan interface{})
 		if peer == rf.me {
 			continue
 		}
 		go func(server int) {
-			defer func() {
-				close(rf.replicatorChPool[server])
-				close(rf.doneChPool[server])
-			}()
+			name := fmt.Sprintf("replicator%d", server)
+			doneCh := rf.createDoneCh(name)
+			defer rf.deleteDoneCh(name)
+
 			for {
 				select {
 				// do heartbeat or AppendEntries()
 				case args := <-rf.replicatorChPool[server]:
 
-					doneCh := make(chan bool)
+					innerDoneCh := make(chan bool)
 					go func() {
 						for {
 							select {
 							case <-rf.replicatorChPool[server]:
-							case <-doneCh:
+							case <-innerDoneCh:
 								return
 							}
 						}
@@ -1139,7 +1143,6 @@ func (rf *Raft) InitReplicator() {
 
 					} else {
 						// send InstallSnapshot() RPC
-						rf.mu.Lock()
 						installSnapshotArgs := InstallSnapshotArgs{
 							Term:              args.Term,
 							LeaderId:          args.LeaderId,
@@ -1150,12 +1153,31 @@ func (rf *Raft) InitReplicator() {
 
 						rf.doInstallSnapshot(server, installSnapshotArgs)
 					}
-					doneCh <- true
+					innerDoneCh <- true
 				// close the goroutine
-				case <-rf.doneChPool[server]:
+				case <-doneCh:
 					return
 				}
 			}
 		}(peer)
 	}
+}
+func (rf *Raft) createDoneCh(name string) <-chan interface{} {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	doneCh := make(chan interface{})
+	rf.doneChPool[name] = doneCh
+
+	return doneCh
+}
+
+func (rf *Raft) deleteDoneCh(name string) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	doneCh := rf.doneChPool[name]
+
+	close(doneCh)
+	delete(rf.doneChPool, name)
 }

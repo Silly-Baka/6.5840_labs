@@ -82,6 +82,7 @@ type Raft struct {
 	matchIndex     []int      // maintained with AppendEntries()
 	applyCh        chan ApplyMsg
 	applyBufferCh  chan ApplyMsg // a buffer that store the applyMsg
+	applierDoneCh  chan interface{}
 
 	// 2D
 	lastIncludedTerm  int
@@ -416,9 +417,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 
-	DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	DPrintf("[%v] get heartbeat from [%v]", rf.me, args.LeaderId)
 
 	//DPrintf("[%v] term %v ,cur log is %v, entries is %v", rf.me, rf.currentTerm, rf.log, args)
 
@@ -539,8 +541,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					Command:      entry.Command,
 					CommandIndex: idx + i + 1,
 				}
-				//rf.applyBufferCh <- applyMsg
-				rf.applyCh <- applyMsg
+				rf.applyBufferCh <- applyMsg
+				//rf.applyCh <- applyMsg
 				DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
 			}
 		}
@@ -615,6 +617,7 @@ func (rf *Raft) Kill() {
 	for _, doneCh := range rf.doneChPool {
 		doneCh <- true
 	}
+	rf.applierDoneCh <- true
 }
 
 func (rf *Raft) killed() bool {
@@ -685,12 +688,17 @@ func (rf *Raft) prepareApply() {
 
 // a goroutine that listen to the applyBufferCh and send applyMsg to applyCh
 func (rf *Raft) applier() {
-	for applyMsg := range rf.applyBufferCh {
-		if rf.killed() {
+	defer func() {
+		close(rf.applierDoneCh)
+		close(rf.applyBufferCh)
+	}()
+	for !rf.killed() {
+		select {
+		case applyMsg := <-rf.applyBufferCh:
+			rf.applyCh <- applyMsg
+		case <-rf.applierDoneCh:
 			return
 		}
-		rf.applyCh <- applyMsg
-		DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
 	}
 }
 
@@ -719,6 +727,10 @@ func (rf *Raft) NewElection() {
 
 	total := len(rf.peers)
 	voteCh := make(chan bool, total)
+
+	//defer func() {
+	//	close(voteCh)
+	//}()
 	// get vote from each peer
 	for idx := range rf.peers {
 		if idx == rf.me {
@@ -728,6 +740,7 @@ func (rf *Raft) NewElection() {
 		go func(server int) {
 
 			if rf.killed() || rf.state != Candidate {
+				voteCh <- false
 				return
 			}
 			reply := RequestVoteReply{}
@@ -746,13 +759,6 @@ func (rf *Raft) NewElection() {
 				voteCh <- false
 				return
 			}
-
-			//if reply.VoteGranted {
-			//	DPrintf("[%v] success get vote from %v", rf.me, server)
-			//} else {
-			//	DPrintf("[%v] failed to get vote from %v", rf.me, server)
-			//}
-
 			// find a new higher term and convert to follower
 			if reply.Term > rf.currentTerm {
 				DPrintf("[%v] find a new higher term and convert to follower", rf.me)
@@ -781,7 +787,8 @@ func (rf *Raft) NewElection() {
 		if rf.state != Candidate || rf.currentTerm != args.Term || rf.killed() {
 			DPrintf("[%v] failed in the election", rf.me)
 			rf.mu.Unlock()
-			break
+
+			return
 		}
 		rf.mu.Unlock()
 
@@ -837,29 +844,23 @@ func (rf *Raft) heartbeat() {
 	//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
 
 	heartBeatTimer := time.NewTimer(HeartBeatTimeout)
-	isDone := false
-
-	cond := sync.Cond{L: &rf.mu}
 
 	go func() {
-		rf.doneChPool[rf.me] = make(chan interface{})
 		for {
 			select {
 			case <-heartBeatTimer.C:
 				rf.mu.Lock()
 				// stop heartbeat if not leader
 				if rf.killed() || rf.state != Leader {
-					isDone = true
 					go func() {
 						if !heartBeatTimer.Stop() {
 							<-heartBeatTimer.C
 						}
 					}()
 					rf.mu.Unlock()
-					cond.Broadcast()
 					DPrintf("[%v] stop the heartBeat", rf.me)
 
-					break
+					return
 				}
 				rf.mu.Unlock()
 
@@ -876,11 +877,6 @@ func (rf *Raft) heartbeat() {
 			}
 		}
 	}()
-	rf.mu.Lock()
-	for !isDone {
-		cond.Wait()
-	}
-	rf.mu.Unlock()
 }
 
 // dispatch the rpc
@@ -931,8 +927,6 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 	if preLogIndex+1 < rf.logicNextIndex {
 		args.Entries = rf.log[preLogIndex+1:]
 	}
-
-	DPrintf("---[%v] append args is [%v]", rf.me, args)
 	rf.mu.Unlock()
 
 	DPrintf("[%v] send heartbeat to [%v]", rf.me, server)
@@ -949,7 +943,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 
 	rf.mu.Lock()
 	// throw the overdue reply
-	if rf.currentTerm != args.Term || rf.state != Leader {
+	if rf.killed() || rf.currentTerm != args.Term || rf.state != Leader {
 		rf.mu.Unlock()
 		return
 	}
@@ -1027,8 +1021,8 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 								Command:      entry.Command,
 								CommandIndex: cur + i + 1,
 							}
-							//rf.applyBufferCh <- applyMsg
-							rf.applyCh <- applyMsg
+							rf.applyBufferCh <- applyMsg
+							//rf.applyCh <- applyMsg
 							DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
 						}
 					}
@@ -1100,7 +1094,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	rf.InitReplicator()
-
 	go rf.ticker() // start applier goroutine to listen apply entries
 	go rf.applier()
 
@@ -1108,16 +1101,31 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 func (rf *Raft) InitReplicator() {
 	for peer := range rf.peers {
+		rf.replicatorChPool[peer] = make(chan AppendEntriesArgs)
+		rf.doneChPool[peer] = make(chan interface{})
 		if peer == rf.me {
 			continue
 		}
 		go func(server int) {
-			rf.replicatorChPool[server] = make(chan AppendEntriesArgs)
-			rf.doneChPool[server] = make(chan interface{})
+			defer func() {
+				close(rf.replicatorChPool[server])
+				close(rf.doneChPool[server])
+			}()
 			for {
 				select {
 				// do heartbeat or AppendEntries()
 				case args := <-rf.replicatorChPool[server]:
+
+					doneCh := make(chan bool)
+					go func() {
+						for {
+							select {
+							case <-rf.replicatorChPool[server]:
+							case <-doneCh:
+								return
+							}
+						}
+					}()
 
 					DPrintf("[%v] doing appendEntries to [%v]", rf.me, server)
 
@@ -1127,7 +1135,7 @@ func (rf *Raft) InitReplicator() {
 					if rf.nextIndex[server] > rf.lastIncludedIndex {
 						rf.mu.Unlock()
 
-						go rf.doAppendEntries(server, args)
+						rf.doAppendEntries(server, args)
 
 					} else {
 						// send InstallSnapshot() RPC
@@ -1140,8 +1148,9 @@ func (rf *Raft) InitReplicator() {
 						}
 						rf.mu.Unlock()
 
-						go rf.doInstallSnapshot(server, installSnapshotArgs)
+						rf.doInstallSnapshot(server, installSnapshotArgs)
 					}
+					doneCh <- true
 				// close the goroutine
 				case <-rf.doneChPool[server]:
 					return

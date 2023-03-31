@@ -219,16 +219,16 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.state = Follower
-		rf.electionTimer.Reset(getElectionTimeout())
 
 		rf.persist()
 	}
 	if rf.state != Follower {
 		rf.state = Follower
 	}
+	rf.electionTimer.Reset(getElectionTimeout())
 
 	// replace the current snapshot
-	if args.LastIncludedIndex > rf.lastIncludedIndex || args.LastIncludedIndex >= rf.realNextIndex {
+	if args.LastIncludedIndex > rf.lastIncludedIndex {
 		reply.Success = true
 
 		rf.snapshot = args.Snapshot
@@ -236,18 +236,28 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.lastIncludedTerm = args.LastIncludedTerm
 		rf.realNextIndex = args.LastIncludedIndex + 1
 
+		// maybe have been already committed/applied ( appendEntries faster than InstallSnapshot)
+		if rf.lastIncludedIndex > rf.lastApplied {
+			rf.lastApplied = args.LastIncludedIndex
+		}
+		if rf.lastIncludedIndex > rf.commitIndex {
+			rf.commitIndex = args.LastIncludedIndex
+		}
+
 		DPrintf("[%v] apply index from [%v] to [%v]", rf.me, rf.lastApplied, rf.lastIncludedIndex)
-		rf.lastApplied = rf.lastIncludedIndex
-		rf.commitIndex = rf.lastIncludedIndex
 
 		// discard the log entries recovered by snapshot
 		lastIncludeIndex := rf.realToLogic(args.LastIncludedIndex)
+
+		//discardEntry := []LogEntry{}
 		if lastIncludeIndex < rf.logicNextIndex && rf.log[lastIncludeIndex].Term == args.LastIncludedTerm {
 
+			//discardEntry = append(discardEntry, rf.log[1:lastIncludeIndex+1]...)
 			rf.log = append([]LogEntry{{rf.lastIncludedTerm, nil}}, rf.log[lastIncludeIndex+1:]...)
 			rf.logicNextIndex = len(rf.log)
 
 		} else {
+			//discardEntry = append(discardEntry, rf.log[1:]...)
 			rf.log = []LogEntry{{rf.lastIncludedTerm, nil}}
 			rf.logicNextIndex = 1
 		}
@@ -261,15 +271,14 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 		// apply snapshot to local state machine
 		applyMsg := ApplyMsg{
+			CommandValid:  false,
 			SnapshotValid: true,
 			Snapshot:      args.Snapshot,
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
-		//go func() {
-		//	rf.applyCh <- applyMsg
-		//}()
-		rf.applierCh <- applyMsg
+
+		rf.applyCh <- applyMsg
 		DPrintf("[%v] apply index is [%v] - [%v]", rf.me, 1, applyMsg.SnapshotIndex)
 	} else {
 		//rf.mu.Unlock()
@@ -543,6 +552,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.commitIndex = rf.realNextIndex - 1
 		}
 		DPrintf("[%v] follower commitIndex change to %v", rf.me, rf.commitIndex)
+		DPrintf("[%v] realNextIndex is [%v], lastIncludedIndex is [%v]", rf.me, rf.realNextIndex, rf.lastIncludedIndex)
 
 		// ask the applier
 		go func() {
@@ -849,9 +859,9 @@ func (rf *Raft) NewElection() {
 	}
 }
 
-// get election timeout between 200ms ~ 400ms randomly
+// get election timeout between 200ms ~ 300ms randomly
 func getElectionTimeout() time.Duration {
-	ms := 200 + (rand.Int63() % 200)
+	ms := 200 + (rand.Int63() % 150)
 	//time := time.Duration(ms) * time.Millisecond
 	//DPrintf("[%v] new election time:[%v]", rf.me, time)
 	return time.Duration(ms) * time.Millisecond
@@ -1064,7 +1074,21 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 		//rf.mu.Lock()
 		rf.lock("doAppendEntries")
 		DPrintf("[%v] follower %v refuse, xTerm is %v, xIndex is %v", rf.me, server, reply.XTerm, reply.XIndex)
-		rf.nextIndex[server] = reply.XIndex
+
+		// find the index that beyond the last entry of XTerm
+		find := false
+		idx := 0
+		for i, entry := range rf.log {
+			if entry.Term == reply.XTerm {
+				find = true
+				idx = i
+			}
+		}
+		if find {
+			rf.nextIndex[server] = idx + 1
+		} else {
+			rf.nextIndex[server] = reply.XIndex
+		}
 		DPrintf("[%v] %v's nextIndex is %v", rf.me, server, rf.nextIndex[server])
 		//rf.mu.Unlock()
 		rf.unlock("doAppendEntries")
@@ -1112,7 +1136,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2D
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
-	rf.applierCh = make(chan interface{}, 10000)
+	rf.applierCh = make(chan interface{}, 1000)
 
 	// 2C
 	// initialize from state persisted before a crash
@@ -1135,7 +1159,7 @@ func (rf *Raft) InitReplicator() {
 			doneCh := rf.createDoneCh(name)
 			defer rf.deleteDoneCh(name)
 
-			rf.replicatorChPool[server] = make(chan AppendEntriesArgs, 1)
+			rf.replicatorChPool[server] = make(chan AppendEntriesArgs, 10000)
 
 			for {
 				select {
@@ -1163,6 +1187,7 @@ func (rf *Raft) InitReplicator() {
 						//rf.mu.Unlock()
 						rf.unlock("InitReplicator")
 
+						DPrintf("[%v] follower [%v] delay in [%v], send AppendEntries", rf.me, server, rf.nextIndex[server])
 						rf.doAppendEntries(server, args)
 
 					} else {

@@ -946,7 +946,6 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 		// if heartbeat, should send RPC immediately
 		if isHeartBeat {
 			go rf.doAppendEntries(i, args)
-			continue
 		}
 
 		//rf.mu.Lock()

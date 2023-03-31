@@ -182,7 +182,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if index >= rf.realNextIndex {
 		panic("the snapshot error")
 	}
-	// ignore the repeated snapshot
+	// ignore the repeated/delay snapshot
 	if index <= rf.lastIncludedIndex {
 		return
 	}
@@ -191,10 +191,15 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.lastIncludedIndex = index
 
 	rf.log = append([]LogEntry{{rf.lastIncludedTerm, nil}}, rf.log[logicIndex+1:]...)
-	rf.persist()
-
 	rf.logicNextIndex = len(rf.log)
 	rf.snapshot = snapshot
+
+	if index > rf.commitIndex {
+		rf.lastApplied = index
+		rf.commitIndex = index
+	}
+
+	rf.persist()
 	DPrintf("[%v] snapshot last index is %v", rf.me, index)
 	DPrintf("[%v] cur log is %v", rf.me, rf.log)
 }
@@ -205,7 +210,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lock("InstallSnapshot")
 	//defer rf.mu.Unlock()
 
-	reply.Success = false
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
@@ -227,63 +231,56 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	}
 	rf.electionTimer.Reset(getElectionTimeout())
 
-	// replace the current snapshot
-	if args.LastIncludedIndex > rf.lastIncludedIndex {
-		reply.Success = true
-
-		rf.snapshot = args.Snapshot
-		rf.lastIncludedIndex = args.LastIncludedIndex
-		rf.lastIncludedTerm = args.LastIncludedTerm
-		rf.realNextIndex = args.LastIncludedIndex + 1
-
-		// maybe have been already committed/applied ( appendEntries faster than InstallSnapshot)
-		if rf.lastIncludedIndex > rf.lastApplied {
-			rf.lastApplied = args.LastIncludedIndex
-		}
-		if rf.lastIncludedIndex > rf.commitIndex {
-			rf.commitIndex = args.LastIncludedIndex
-		}
-
-		DPrintf("[%v] apply index from [%v] to [%v]", rf.me, rf.lastApplied, rf.lastIncludedIndex)
-
-		// discard the log entries recovered by snapshot
-		lastIncludeIndex := rf.realToLogic(args.LastIncludedIndex)
-
-		//discardEntry := []LogEntry{}
-		if lastIncludeIndex < rf.logicNextIndex && rf.log[lastIncludeIndex].Term == args.LastIncludedTerm {
-
-			//discardEntry = append(discardEntry, rf.log[1:lastIncludeIndex+1]...)
-			rf.log = append([]LogEntry{{rf.lastIncludedTerm, nil}}, rf.log[lastIncludeIndex+1:]...)
-			rf.logicNextIndex = len(rf.log)
-
-		} else {
-			//discardEntry = append(discardEntry, rf.log[1:]...)
-			rf.log = []LogEntry{{rf.lastIncludedTerm, nil}}
-			rf.logicNextIndex = 1
-		}
-		rf.persist()
-
-		//rf.mu.Unlock()
+	// refuse repeated snapshot
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		rf.unlock("InstallSnapshot")
 
-		DPrintf("[%v] get snapshot from leader [%v], lastInclude is [%v]", rf.me, args.LeaderId, args.LastIncludedIndex)
-		DPrintf("[%v] cur log is %v", rf.me, rf.log)
-
-		// apply snapshot to local state machine
-		applyMsg := ApplyMsg{
-			CommandValid:  false,
-			SnapshotValid: true,
-			Snapshot:      args.Snapshot,
-			SnapshotTerm:  args.LastIncludedTerm,
-			SnapshotIndex: args.LastIncludedIndex,
-		}
-
-		rf.applyCh <- applyMsg
-		DPrintf("[%v] apply index is [%v] - [%v]", rf.me, 1, applyMsg.SnapshotIndex)
-	} else {
-		//rf.mu.Unlock()
-		rf.unlock("InstallSnapshot")
+		return
 	}
+	DPrintf("[%v] apply index from [%v] to [%v]", rf.me, rf.lastApplied, rf.lastIncludedIndex)
+
+	// discard the log entries recovered by snapshot
+	lastIncludeIndex := rf.realToLogic(args.LastIncludedIndex)
+
+	//discardEntry := []LogEntry{}
+	if lastIncludeIndex < rf.logicNextIndex && rf.log[lastIncludeIndex].Term == args.LastIncludedTerm {
+
+		//discardEntry = append(discardEntry, rf.log[1:lastIncludeIndex+1]...)
+		rf.log = append([]LogEntry{{args.LastIncludedTerm, nil}}, rf.log[lastIncludeIndex+1:]...)
+		rf.logicNextIndex = len(rf.log)
+
+	} else {
+		//discardEntry = append(discardEntry, rf.log[1:]...)
+		rf.log = []LogEntry{{args.LastIncludedTerm, nil}}
+		rf.logicNextIndex = 1
+	}
+	rf.snapshot = args.Snapshot
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.realNextIndex = args.LastIncludedIndex + 1
+	rf.lastApplied = args.LastIncludedIndex
+	rf.commitIndex = args.LastIncludedIndex
+
+	rf.persist()
+
+	//rf.mu.Unlock()
+	rf.unlock("InstallSnapshot")
+
+	DPrintf("[%v] get snapshot from leader [%v], lastInclude is [%v]", rf.me, args.LeaderId, args.LastIncludedIndex)
+	DPrintf("[%v] cur log is %v", rf.me, rf.log)
+
+	// apply snapshot to local state machine
+	applyMsg := ApplyMsg{
+		CommandValid:  false,
+		SnapshotValid: true,
+		Snapshot:      args.Snapshot,
+		SnapshotTerm:  args.LastIncludedTerm,
+		SnapshotIndex: args.LastIncludedIndex,
+	}
+	go func() {
+		rf.applyCh <- applyMsg
+	}()
+	DPrintf("[%v] apply index is [%v] - [%v]", rf.me, 1, applyMsg.SnapshotIndex)
 }
 
 func (rf *Raft) doInstallSnapshot(server int, args InstallSnapshotArgs) {
@@ -323,10 +320,10 @@ func (rf *Raft) doInstallSnapshot(server int, args InstallSnapshotArgs) {
 
 		rf.persist()
 	}
-	if reply.Success {
-		rf.nextIndex[server] = rf.lastIncludedIndex + 1
-		rf.matchIndex[server] = rf.lastIncludedIndex
-	}
+
+	rf.nextIndex[server] = rf.lastIncludedIndex + 1
+	rf.matchIndex[server] = rf.lastIncludedIndex
+
 	rf.unlock("doInstallSnapshot")
 }
 
@@ -691,43 +688,48 @@ func (rf *Raft) applier() {
 		case <-rf.applierCh:
 			//rf.mu.Lock()
 			rf.lock("applier")
-			if rf.lastApplied < rf.commitIndex {
-				idx := rf.lastApplied
 
-				lastApplied := rf.realToLogic(rf.lastApplied)
-				commitIndex := rf.realToLogic(rf.commitIndex)
-
-				// have been snapshot, do not need to apply
-				if lastApplied < 0 {
-					//rf.mu.Unlock()
-					rf.unlock("applier")
-					return
-				}
-
-				entries := append([]LogEntry{}, rf.log[lastApplied+1:commitIndex+1]...)
-				rf.lastApplied = rf.commitIndex
-
-				DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
-				DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
+			if rf.lastApplied >= rf.commitIndex {
 				//rf.mu.Unlock()
 				rf.unlock("applier")
-
-				DPrintf("[%v] test deadlock", rf.me)
-
-				for i, entry := range entries {
-					applyMsg := ApplyMsg{
-						CommandValid: true,
-						Command:      entry.Command,
-						CommandIndex: idx + i + 1,
-					}
-					//rf.applierCh <- applyMsg
-					rf.applyCh <- applyMsg
-					DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
-				}
-			} else {
-				//rf.mu.Unlock()
-				rf.unlock("applier")
+				break
 			}
+
+			lastApplied := rf.lastApplied
+			commitIndex := rf.commitIndex
+			logicLastApplied := rf.realToLogic(lastApplied)
+			logicCommitIndex := rf.realToLogic(commitIndex)
+
+			// have been snapshot, do not need to apply
+			if logicLastApplied < 0 {
+				//rf.mu.Unlock()
+				rf.unlock("applier")
+				return
+			}
+
+			entries := append([]LogEntry{}, rf.log[logicLastApplied+1:logicCommitIndex+1]...)
+
+			DPrintf("[%v] apply from [%v] to index [%v]", rf.me, lastApplied, commitIndex)
+			//rf.mu.Unlock()
+			rf.unlock("applier")
+
+			for i, entry := range entries {
+				applyMsg := ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: lastApplied + i + 1,
+				}
+				//rf.applierCh <- applyMsg
+				rf.applyCh <- applyMsg
+				DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
+			}
+
+			rf.lock("applier")
+			if commitIndex > rf.lastApplied {
+				rf.lastApplied = commitIndex
+			}
+			rf.unlock("applier")
+
 		case <-doneCh:
 			return
 		}

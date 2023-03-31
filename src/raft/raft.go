@@ -82,7 +82,7 @@ type Raft struct {
 	nextIndex      []int      // the next index of log will be sent to follower
 	matchIndex     []int      // maintained with AppendEntries()
 	applyCh        chan ApplyMsg
-	applyBufferCh  chan ApplyMsg // a buffer that store the applyMsg
+	applierCh      chan interface{} // a buffer that store the applyMsg
 
 	// 2D
 	lastIncludedTerm  int
@@ -129,6 +129,7 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.currentTerm)
 	encoder.Encode(rf.votedFor)
 	encoder.Encode(rf.log)
+
 	encoder.Encode(rf.realNextIndex)
 	// we need more information about snapshot
 	encoder.Encode(rf.lastIncludedIndex)
@@ -163,6 +164,7 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
+
 	rf.log = log
 	rf.realNextIndex = realNextIndex
 	rf.logicNextIndex = len(log)
@@ -204,13 +206,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // Leader calls this to update Followers' state
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	//defer rf.mu.Unlock()
 
 	reply.Success = false
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
 
 		return
 	}
@@ -250,6 +253,8 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		}
 		rf.persist()
 
+		rf.mu.Unlock()
+
 		DPrintf("[%v] get snapshot from leader [%v], lastInclude is [%v]", rf.me, args.LeaderId, args.LastIncludedIndex)
 		DPrintf("[%v] cur log is %v", rf.me, rf.log)
 
@@ -260,8 +265,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 			SnapshotTerm:  args.LastIncludedTerm,
 			SnapshotIndex: args.LastIncludedIndex,
 		}
-		//rf.applyBufferCh <- applyMsg
-		rf.applyCh <- applyMsg
+		go func() {
+			rf.applyCh <- applyMsg
+		}()
+	} else {
+		rf.mu.Unlock()
 	}
 }
 
@@ -508,10 +516,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 	//DPrintf("[%v] heartbeat persist", rf.me)
-	rf.persist()
 
 	//DPrintf("[%v] heartbeat check commitIndex", rf.me)
 	// check commitIndex
+
 	if args.LeaderCommit > rf.commitIndex {
 		// commit entry and reset commitIndex
 		if args.LeaderCommit < rf.realNextIndex {
@@ -521,32 +529,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		DPrintf("[%v] follower commitIndex change to %v", rf.me, rf.commitIndex)
 
-		// prepare applyMsg
-		//go rf.prepareApply()
-		lastApplied := rf.realToLogic(rf.lastApplied)
-		commitIndex := rf.realToLogic(rf.commitIndex)
-		if rf.lastApplied < rf.commitIndex && lastApplied >= 0 {
-			idx := rf.lastApplied
-
-			entries := append([]LogEntry{}, rf.log[lastApplied+1:commitIndex+1]...)
-			rf.lastApplied = rf.commitIndex
-
-			DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
-			DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
-
-			DPrintf("[%v] test deadlock", rf.me)
-
-			for i, entry := range entries {
-				applyMsg := ApplyMsg{
-					CommandValid: true,
-					Command:      entry.Command,
-					CommandIndex: idx + i + 1,
-				}
-				//rf.applyBufferCh <- applyMsg
-				rf.applyCh <- applyMsg
-				DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
-			}
-		}
+		// ask the applier
+		go func() {
+			rf.applierCh <- struct{}{}
+		}()
 	}
 	reply.Term = rf.currentTerm
 	reply.Success = true
@@ -628,13 +614,16 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
+	doneCh := rf.createDoneCh("ticker")
+	defer rf.deleteDoneCh("ticker")
 
 	//testTimer := time.NewTimer(300 * time.Millisecond)
-	for rf.killed() == false {
+	for !rf.killed() {
 		// Your code here (2A)
 		//Check if a leader election should be started.
+		startTime := time.Now()
 		select {
-		case <-rf.electionTimer.C:
+		case tm := <-rf.electionTimer.C:
 			rf.mu.Lock()
 			if rf.state == Leader {
 				rf.mu.Unlock()
@@ -644,66 +633,70 @@ func (rf *Raft) ticker() {
 
 			rf.mu.Unlock()
 
-			DPrintf("[%v] election timeout, start new election", rf.me)
+			difTime := time.Duration(tm.UnixMilli()-startTime.UnixMilli()) * time.Millisecond
+			DPrintf("[%v] election timeout, start new election [%v]", rf.me, difTime)
 			rf.NewElection()
-		}
-	}
-	DPrintf("[%v] leader is dead", rf.me)
-}
 
-// check and prepare the applyMsg to buffer
-func (rf *Raft) prepareApply() {
-	rf.mu.Lock()
-	if rf.lastApplied < rf.commitIndex {
-		idx := rf.lastApplied
-
-		lastApplied := rf.realToLogic(rf.lastApplied)
-		commitIndex := rf.realToLogic(rf.commitIndex)
-
-		// have been snapshot, do not need to apply
-		if lastApplied < 0 {
-			rf.mu.Unlock()
+		case <-doneCh:
+			go func() {
+				if !rf.electionTimer.Stop() {
+					<-rf.electionTimer.C
+				}
+			}()
+			DPrintf("[%v] peer is killed", rf.me)
 			return
 		}
-
-		entries := append([]LogEntry{}, rf.log[lastApplied+1:commitIndex+1]...)
-		rf.lastApplied = rf.commitIndex
-
-		DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
-		DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
-		rf.mu.Unlock()
-
-		DPrintf("[%v] test deadlock", rf.me)
-
-		for i, entry := range entries {
-			applyMsg := ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
-				CommandIndex: idx + i + 1,
-			}
-			//rf.applyBufferCh <- applyMsg
-			rf.applyCh <- applyMsg
-		}
-		return
 	}
-	rf.mu.Unlock()
 }
 
-// a goroutine that listen to the applyBufferCh and send applyMsg to applyCh
-//func (rf *Raft) applier() {
-//	doneCh := rf.createDoneCh("applierCh")
-//	defer rf.deleteDoneCh("applierCh")
-//
-//	for {
-//		select {
-//		case applyMsg := <-rf.applyBufferCh:
-//			rf.applyCh <- applyMsg
-//
-//		case <-doneCh:
-//			return
-//		}
-//	}
-//}
+// goroutine that responsible for applyMsg
+func (rf *Raft) applier() {
+	doneCh := rf.createDoneCh("applier")
+	defer rf.deleteDoneCh("applier")
+
+	for {
+		select {
+		case <-rf.applierCh:
+			rf.mu.Lock()
+			if rf.lastApplied < rf.commitIndex {
+				idx := rf.lastApplied
+
+				lastApplied := rf.realToLogic(rf.lastApplied)
+				commitIndex := rf.realToLogic(rf.commitIndex)
+
+				// have been snapshot, do not need to apply
+				if lastApplied < 0 {
+					rf.mu.Unlock()
+					return
+				}
+
+				entries := append([]LogEntry{}, rf.log[lastApplied+1:commitIndex+1]...)
+				rf.lastApplied = rf.commitIndex
+
+				DPrintf("[%v] apply from [%v] to index [%v]", rf.me, idx, rf.lastApplied)
+				DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
+				rf.mu.Unlock()
+
+				DPrintf("[%v] test deadlock", rf.me)
+
+				for i, entry := range entries {
+					applyMsg := ApplyMsg{
+						CommandValid: true,
+						Command:      entry.Command,
+						CommandIndex: idx + i + 1,
+					}
+					//rf.applierCh <- applyMsg
+					rf.applyCh <- applyMsg
+					DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
+				}
+			} else {
+				rf.mu.Unlock()
+			}
+		case <-doneCh:
+			return
+		}
+	}
+}
 
 // start a new election
 func (rf *Raft) NewElection() {
@@ -771,8 +764,8 @@ func (rf *Raft) NewElection() {
 				rf.votedFor = -1
 				rf.electionTimer.Reset(getElectionTimeout())
 
-				voteCh <- false
 				rf.persist()
+				voteCh <- false
 				return
 			}
 			voteCh <- reply.VoteGranted
@@ -845,17 +838,19 @@ func (rf *Raft) heartbeat() {
 	go rf.doDispatchRPC(true)
 	//DPrintf("[%v] heartbeat [%v]", rf.me, ct)
 
-	heartBeatTimer := time.NewTimer(HeartBeatTimeout)
-
 	go func() {
-		name := "heartbeatCh"
-		doneCh := rf.createDoneCh(name)
-		defer rf.deleteDoneCh(name)
+		doneCh := rf.createDoneCh("heartbeatCh")
+		defer func() {
+			rf.deleteDoneCh("heartbeatCh")
+			DPrintf("[%v] heartbeat stop", rf.me)
+		}()
+
+		heartBeatTimer := time.NewTimer(HeartBeatTimeout)
 
 		for {
 			select {
 			case <-heartBeatTimer.C:
-				rf.mu.Lock()
+				rf.lock("heartbeat")
 				// stop heartbeat if not leader
 				if rf.killed() || rf.state != Leader {
 					go func() {
@@ -863,12 +858,13 @@ func (rf *Raft) heartbeat() {
 							<-heartBeatTimer.C
 						}
 					}()
-					rf.mu.Unlock()
+					rf.unlock("heartbeat")
+
 					DPrintf("[%v] stop the heartBeat", rf.me)
 
 					return
 				}
-				rf.mu.Unlock()
+				rf.unlock("heartbeat")
 
 				go rf.doDispatchRPC(true)
 				heartBeatTimer.Reset(HeartBeatTimeout)
@@ -888,13 +884,15 @@ func (rf *Raft) heartbeat() {
 // dispatch the rpc
 func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 
-	rf.mu.Lock()
+	//rf.mu.Lock()
+	rf.lock("dispatchRPC")
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		LeaderCommit: rf.commitIndex,
 	}
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
+	rf.unlock("dispatchRPC")
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -906,13 +904,16 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 			continue
 		}
 
-		rf.mu.Lock()
+		//rf.mu.Lock()
+		rf.lock("dispatchRPC")
 		if rf.nextIndex[i] < rf.realNextIndex {
-			rf.mu.Unlock()
+			rf.unlock("dispatchRPC")
 
 			go func(peer int) {
 				rf.replicatorChPool[peer] <- args
 			}(i)
+		} else {
+			rf.unlock("dispatchRPC")
 		}
 	}
 }
@@ -920,20 +921,26 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 // the real logic of heartbeat: send AppendEntries() to each peer if become leader
 func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 
-	rf.mu.Lock()
+	//rf.mu.Lock()
+	rf.lock("doAppendEntries")
 	if rf.killed() || rf.state != Leader {
-		rf.mu.Unlock()
+		//rf.mu.Unlock()
+		rf.unlock("doAppendEntries")
 		return
 	}
 
 	preLogIndex := rf.realToLogic(rf.nextIndex[server] - 1)
-	args.PrevLogIndex = rf.nextIndex[server] - 1
-	args.PrevLogTerm = rf.log[preLogIndex].Term
 
-	if preLogIndex+1 < rf.logicNextIndex {
+	if preLogIndex >= 0 {
+		args.PrevLogTerm = rf.log[preLogIndex].Term
+	}
+	args.PrevLogIndex = rf.nextIndex[server] - 1
+
+	if preLogIndex+1 > 0 && preLogIndex+1 < rf.logicNextIndex {
 		args.Entries = rf.log[preLogIndex+1:]
 	}
-	rf.mu.Unlock()
+	//rf.mu.Unlock()
+	rf.unlock("doAppendEntries")
 
 	DPrintf("[%v] send heartbeat to [%v]", rf.me, server)
 	reply := AppendEntriesReply{}
@@ -999,42 +1006,14 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 				if count > len(rf.peers)/2 {
 					rf.commitIndex = idx
 
-					// update commitIndex and apply entry
-					if rf.lastApplied < rf.commitIndex {
+					rf.mu.Unlock()
 
-						cur := rf.lastApplied
-
-						lastApplied := rf.realToLogic(rf.lastApplied)
-						commitIndex := rf.realToLogic(rf.commitIndex)
-
-						// have been snapshot, do not need to apply
-						if lastApplied < 0 {
-							cur = rf.lastIncludedIndex
-							lastApplied = 0
-						}
-
-						entries := append([]LogEntry{}, rf.log[lastApplied+1:commitIndex+1]...)
-						rf.lastApplied = rf.commitIndex
-
-						DPrintf("[%v] apply from [%v] to index [%v]", rf.me, cur, rf.lastApplied)
-						DPrintf("[%v] cur log is %v, realnextIndex is [%v]", rf.me, rf.log, rf.realNextIndex)
-
-						DPrintf("[%v] test deadlock", rf.me)
-
-						for i, entry := range entries {
-							applyMsg := ApplyMsg{
-								CommandValid: true,
-								Command:      entry.Command,
-								CommandIndex: cur + i + 1,
-							}
-							//rf.applyBufferCh <- applyMsg
-							rf.applyCh <- applyMsg
-							DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
-						}
-					}
+					// update and check apply
+					rf.applierCh <- struct{}{}
 
 					DPrintf("[%v] leader commitIndex is %v", rf.me, idx)
-					break
+
+					return
 				}
 			}
 		}
@@ -1091,17 +1070,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2D
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
-	rf.applyBufferCh = make(chan ApplyMsg, 10000)
+	rf.applierCh = make(chan interface{}, 10000)
 
 	// 2C
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-	rf.log[0].Term = rf.lastIncludedTerm
 
 	// start ticker goroutine to start elections
 	rf.InitReplicator()
 	go rf.ticker() // start applier goroutine to listen apply entries
-	//go rf.applier()
+	go rf.applier()
 
 	return rf
 }
@@ -1180,4 +1158,15 @@ func (rf *Raft) deleteDoneCh(name string) {
 
 	close(doneCh)
 	delete(rf.doneChPool, name)
+
+	DPrintf("[%v] channel %v has been closed", rf.me, name)
+}
+
+func (rf *Raft) lock(name string) {
+	DPrintf("[%v] function [%v()] get this lock", rf.me, name)
+	rf.mu.Lock()
+}
+func (rf *Raft) unlock(name string) {
+	DPrintf("[%v] function [%v()] unlock", rf.me, name)
+	rf.mu.Unlock()
 }

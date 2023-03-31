@@ -1172,7 +1172,7 @@ func snapcommon(t *testing.T, name string, disconnect bool, reliable bool, crash
 			cfg.rafts[sender].Start(rand.Int())
 		}
 
-		// let applyBufferCh threads catch up with the Start()'s
+		// let applierCh threads catch up with the Start()'s
 		if disconnect == false && crash == false {
 			// make sure all followers have caught up, so that
 			// an InstallSnapshot RPC isn't required for

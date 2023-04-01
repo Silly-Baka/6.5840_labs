@@ -3,9 +3,9 @@ package raft
 import "log"
 
 // Debugging
-const Debug = true
+const Debug = false
 
-const Lock = true
+const Lock = false
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {

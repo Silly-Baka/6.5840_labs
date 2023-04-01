@@ -91,6 +91,7 @@ type Raft struct {
 	// rebuild
 	replicatorChPool []chan AppendEntriesArgs
 	doneChPool       map[string]chan interface{}
+	applyMu          sync.Mutex // the mutex for InstallSnapshot and applier
 }
 
 // return currentTerm and whether this server
@@ -208,14 +209,12 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	//rf.mu.Lock()
 	rf.lock("InstallSnapshot")
-	//defer rf.mu.Unlock()
-
-	reply.Term = rf.currentTerm
+	defer rf.unlock("InstallSnapshot")
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		//rf.mu.Unlock()
-		rf.unlock("InstallSnapshot")
+		//rf.unlock("InstallSnapshot")
 
 		return
 	}
@@ -233,7 +232,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	// refuse repeated snapshot
 	if args.LastIncludedIndex <= rf.lastIncludedIndex {
-		rf.unlock("InstallSnapshot")
+		//rf.unlock("InstallSnapshot")
 
 		return
 	}
@@ -253,18 +252,18 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		//discardEntry = append(discardEntry, rf.log[1:]...)
 		rf.log = []LogEntry{{args.LastIncludedTerm, nil}}
 		rf.logicNextIndex = 1
+		rf.realNextIndex = args.LastIncludedIndex + 1
 	}
 	rf.snapshot = args.Snapshot
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
-	rf.realNextIndex = args.LastIncludedIndex + 1
 	rf.lastApplied = args.LastIncludedIndex
 	rf.commitIndex = args.LastIncludedIndex
 
 	rf.persist()
 
 	//rf.mu.Unlock()
-	rf.unlock("InstallSnapshot")
+	//rf.unlock("InstallSnapshot")
 
 	DPrintf("[%v] get snapshot from leader [%v], lastInclude is [%v]", rf.me, args.LeaderId, args.LastIncludedIndex)
 	DPrintf("[%v] cur log is %v", rf.me, rf.log)
@@ -1076,17 +1075,18 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 		rf.lock("doAppendEntries")
 		DPrintf("[%v] follower %v refuse, xTerm is %v, xIndex is %v", rf.me, server, reply.XTerm, reply.XIndex)
 
-		// find the index that beyond the last entry of XTerm
 		find := false
 		idx := 0
-		for i, entry := range rf.log {
-			if entry.Term == reply.XTerm {
-				find = true
+		// find the index that beyond the last entry of XTerm
+		for i := len(rf.log) - 1; i >= 0; i-- {
+			if rf.log[i].Term == reply.XTerm {
 				idx = i
+				find = true
+				break
 			}
 		}
 		if find {
-			rf.nextIndex[server] = idx + 1
+			rf.nextIndex[server] = rf.logicToReal(idx + 1)
 		} else {
 			rf.nextIndex[server] = reply.XIndex
 		}
@@ -1137,7 +1137,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2D
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
-	rf.applierCh = make(chan interface{}, 1000)
+	rf.applierCh = make(chan interface{}, 1)
 
 	// 2C
 	// initialize from state persisted before a crash

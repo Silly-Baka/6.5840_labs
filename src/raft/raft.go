@@ -91,7 +91,6 @@ type Raft struct {
 	// rebuild
 	replicatorChPool []chan AppendEntriesArgs
 	doneChPool       map[string]chan interface{}
-	applyMu          sync.Mutex // the mutex for InstallSnapshot and applier
 }
 
 // return currentTerm and whether this server
@@ -304,7 +303,7 @@ func (rf *Raft) doInstallSnapshot(server int, args InstallSnapshotArgs) {
 	//rf.mu.Lock()
 	rf.lock("doInstallSnapshot")
 	// throw the overdue reply
-	if rf.currentTerm != args.Term || rf.state != Leader {
+	if rf.killed() || rf.currentTerm != args.Term || rf.state != Leader {
 		//rf.mu.Unlock()
 		rf.unlock("doInstallSnapshot")
 
@@ -455,6 +454,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.XIndex = rf.lastIncludedIndex
 	reply.XTerm = 0
+
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
@@ -479,18 +479,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	preLogIndex := rf.realToLogic(args.PrevLogIndex)
 
 	DPrintf("[%v] realNextIndex is [%v]\n logicNextIndex is [%v] \n lastIncludedIndex is [%v]\n preLogIndex is [%v]", rf.me, rf.realNextIndex, rf.logicNextIndex, rf.lastIncludedIndex, preLogIndex)
-	if args.PrevLogIndex >= rf.realNextIndex || preLogIndex >= rf.logicNextIndex || preLogIndex >= 0 && preLogIndex < rf.logicNextIndex && rf.log[preLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= rf.realNextIndex || preLogIndex >= 0 && preLogIndex < rf.logicNextIndex && rf.log[preLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		DPrintf("[%v] heartbeat refuse and check", rf.me)
 		// have no entry in prevLogIndex
 		if args.PrevLogIndex >= rf.realNextIndex {
 			reply.XTerm = -1
 			reply.XIndex = rf.realNextIndex
-		} else if preLogIndex >= rf.logicNextIndex {
-			// maybe crash and have no entry
-			// now we need snapshot
-			reply.XTerm = -1
-			reply.XIndex = -1
 		} else {
 			// delete the conflicting log
 			xTerm := rf.log[preLogIndex].Term
@@ -1078,11 +1073,10 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 		find := false
 		idx := 0
 		// find the index that beyond the last entry of XTerm
-		for i := len(rf.log) - 1; i >= 0; i-- {
-			if rf.log[i].Term == reply.XTerm {
-				idx = i
+		for i, entry := range rf.log {
+			if entry.Term == reply.XTerm {
 				find = true
-				break
+				idx = i
 			}
 		}
 		if find {
@@ -1160,7 +1154,7 @@ func (rf *Raft) InitReplicator() {
 			doneCh := rf.createDoneCh(name)
 			defer rf.deleteDoneCh(name)
 
-			rf.replicatorChPool[server] = make(chan AppendEntriesArgs, 10000)
+			rf.replicatorChPool[server] = make(chan AppendEntriesArgs, 1000)
 
 			for {
 				select {

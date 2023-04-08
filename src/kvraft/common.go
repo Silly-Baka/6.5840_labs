@@ -4,6 +4,12 @@ const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	CkLock         = false
+	KvLock         = true
+
+	GET    = "Get"
+	PUT    = "Put"
+	APPEND = "Append"
 )
 
 type Err string
@@ -16,18 +22,23 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Id int64 // only id
 }
 
 type PutAppendReply struct {
-	Err Err
+	Err         Err
+	CommitIndex int
 }
 
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	CommitIndex int
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
+	// todo
+	CommitIndex int
 }

@@ -1244,3 +1244,17 @@ func (rf *Raft) unlock(name string) {
 		DPrintf("[%v] function [%v()] unlock", rf.me, name)
 	}
 }
+
+func (rf *Raft) GetLastApplied() int {
+	rf.lock("GetLastApplied")
+	defer rf.unlock("GetLastApplied")
+
+	return rf.lastApplied
+}
+
+func (rf *Raft) GetCommitIndex() int {
+	rf.lock("GetCommitIndex")
+	defer rf.unlock("GetCommitIndex")
+
+	return rf.commitIndex
+}

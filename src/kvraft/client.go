@@ -8,8 +8,6 @@ import (
 import "crypto/rand"
 import "math/big"
 
-var clerkCount int = 0
-
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 
@@ -18,14 +16,14 @@ type Clerk struct {
 	mu          sync.Mutex
 	commitIndex int
 	lastLeader  int
-	me          int
+	me          int64
+	seq         int // the sequence of request
 }
 
 type RequestFuture struct {
 	method     string
 	args       []string
 	responseCh chan interface{}
-	id         int64 // global only id that identify the request
 }
 
 func nrand() int64 {
@@ -40,8 +38,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 
-	ck.me = clerkCount
-	clerkCount++
+	// get unique Id
+	ck.me = nrand()
 	ck.requestCh = make(chan RequestFuture)
 
 	go ck.requestHandler()
@@ -59,29 +57,44 @@ func (ck *Clerk) requestHandler() {
 		case future := <-ck.requestCh:
 			switch future.method {
 			case GET:
+				ck.lock("requestHandler_Get")
+
+				commitIndex := ck.commitIndex
 				args := GetArgs{
-					Key: future.args[0],
+					Key:         future.args[0],
+					CommitIndex: commitIndex,
+					ClientId:    ck.me,
+					Seq:         ck.seq + 1,
 				}
+				ck.seq++
+
+				ck.unlock("requestHandler_Get")
+
 				reply := GetReply{}
 				// blocking and waiting for response
 				ck.SendGet(&args, &reply)
 
-				ck.lock("requestHandler_Get")
-				if reply.CommitIndex > ck.commitIndex {
+				if reply.CommitIndex > commitIndex {
+					ck.lock("requestHandler_Get")
 					ck.commitIndex = reply.CommitIndex
+					ck.unlock("requestHandler_Get")
 				}
-				ck.unlock("requestHandler_Get")
 
 				future.responseCh <- reply.Value
 			default:
 				// Put or Append
+				ck.lock("requestHandler_PutAppend")
 				args := PutAppendArgs{
-					Key:   future.args[0],
-					Value: future.args[1],
-					Op:    future.method,
-					Id:    nrand(),
+					Key:      future.args[0],
+					Value:    future.args[1],
+					Op:       future.method,
+					ClientId: ck.me,
+					Seq:      ck.seq + 1,
 				}
+				ck.seq++
 				reply := PutAppendReply{}
+				ck.unlock("requestHandler_PutAppend")
+
 				// blocking and waiting for response
 				ck.SendPutAppend(&args, &reply)
 
@@ -120,7 +133,6 @@ func (ck *Clerk) Get(key string) string {
 			method:     GET,
 			args:       []string{key},
 			responseCh: ch,
-			id:         nrand(),
 		}
 	}()
 
@@ -155,7 +167,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 			method:     op,
 			args:       []string{key, value},
 			responseCh: ch,
-			id:         nrand(),
 		}
 	}()
 	// waiting for resp
@@ -164,25 +175,25 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 }
 
-func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) bool {
+func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) {
 
 	// send to lastLeader first
 	ck.lock("SendGet")
 	lastLeader := ck.lastLeader
 	ck.unlock("SendGet")
 
-	DPrintf("[%v] client call get [%v] and waiting", ck.me, args.Key)
+	DPrintf("[%v] client call get [%v] to server [%v]", ck.me, args.Key, lastLeader)
 	if ok := ck.servers[lastLeader].Call("KVServer.Get", args, reply); ok {
 		// have no err means that get value successfully
-		if reply.Err == "" {
+		if reply.Err == OK || reply.Err == ErrNoKey {
 			DPrintf("[%v] client success get [%v]", ck.me, args.Key)
-			return ok
+			return
 		}
 	}
 	// retry until get value successfully
 	for {
 		for i, server := range ck.servers {
-			DPrintf("[%v] client call get [%v] and waiting", ck.me, args.Key)
+			DPrintf("[%v] client call get [%v] to server [%v]", ck.me, args.Key, i)
 			if ok := server.Call("KVServer.Get", args, reply); ok {
 				// have no err means that get value successfully
 				if reply.Err == OK || reply.Err == ErrNoKey {
@@ -193,29 +204,31 @@ func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) bool {
 
 					DPrintf("[%v] client success get [%v]", ck.me, args.Key)
 
-					return ok
+					return
 				}
 			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
 }
-func (ck *Clerk) SendPutAppend(args *PutAppendArgs, reply *PutAppendReply) bool {
+func (ck *Clerk) SendPutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// send to lastLeader first
 	ck.lock("SendPutAppend")
 	lastLeader := ck.lastLeader
 	ck.unlock("SendPutAppend")
 
+	DPrintf("[%v] client sending putAppend [%v:%v] to server [%v]", ck.me, args.Key, args.Value, lastLeader)
 	if ok := ck.servers[lastLeader].Call("KVServer.PutAppend", args, reply); ok {
 		// have no err means that get value successfully
-		if reply.Err == "" {
-			DPrintf("[%v] client success putAppend [%v]", ck.me, args.Key)
-			return ok
+		if reply.Err == OK {
+			DPrintf("[%v] client success putAppend [%v:%v]", ck.me, args.Key, args.Value)
+			return
 		}
 	}
 	// retry until get value successfully
 	for {
 		for i, server := range ck.servers {
+			DPrintf("[%v] client sending putAppend [%v:%v] to server [%v]", ck.me, args.Key, args.Value, i)
 			if ok := server.Call("KVServer.PutAppend", args, reply); ok {
 				// have no err means that get value successfully
 				if reply.Err == OK {
@@ -226,7 +239,7 @@ func (ck *Clerk) SendPutAppend(args *PutAppendArgs, reply *PutAppendReply) bool 
 
 					DPrintf("[%v] client success putAppend [%v]", ck.me, args.Key)
 
-					return ok
+					return
 				}
 			}
 		}

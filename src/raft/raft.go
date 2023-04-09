@@ -537,7 +537,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.LeaderCommit > rf.commitIndex {
 		// commit entry and reset commitIndex
-		if args.LeaderCommit < rf.realNextIndex {
+		if args.LeaderCommit < rf.realNextIndex-1 {
 			rf.commitIndex = args.LeaderCommit
 		} else {
 			rf.commitIndex = rf.realNextIndex - 1
@@ -933,13 +933,18 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 	//rf.mu.Unlock()
 	rf.unlock("dispatchRPC")
 
+	count := atomic.Int32{}
+	count.Store(0)
+
+	once := sync.Once{}
+
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		// if heartbeat, should send RPC immediately
 		if isHeartBeat {
-			go rf.doAppendEntries(i, args)
+			go rf.doAppendEntries(i, args, &count, &once)
 		}
 
 		//rf.mu.Lock()
@@ -957,7 +962,7 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 }
 
 // the real logic of heartbeat: send AppendEntries() to each peer if become leader
-func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
+func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs, count *atomic.Int32, once *sync.Once) {
 
 	//rf.mu.Lock()
 	rf.lock("doAppendEntries")
@@ -980,7 +985,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 	//rf.mu.Unlock()
 	rf.unlock("doAppendEntries")
 
-	DPrintf("[%v] send heartbeat to [%v]", rf.me, server)
+	DPrintf("[%v] send heartbeat to [%v], args: [%v]", rf.me, server, args.String())
 	reply := AppendEntriesReply{}
 
 	DPrintf("[%v] realNextIndex is [%v], lastIncludedIndex is [%v]", rf.me, rf.realNextIndex, rf.lastIncludedIndex)
@@ -1022,6 +1027,22 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 	DPrintf("[%v] peer %v reply is %v", rf.me, server, reply)
 	if reply.Success {
 
+		if count != nil {
+			count.Add(1)
+
+			// majority peer ack this heartbeat
+			if count.Load() > int32(len(rf.peers)/2) {
+				once.Do(func() {
+					rf.lock("countOnce")
+					for i := range rf.matchIndex {
+						rf.matchIndex[i] = args.PrevLogIndex
+					}
+					rf.commitIndex = args.PrevLogIndex
+					rf.unlock("countOnce")
+				})
+			}
+		}
+
 		//rf.mu.Lock()
 		rf.lock("doAppendEntries")
 		// defend another later heartbeat change it
@@ -1029,7 +1050,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 		rf.nextIndex[server] = nextIndex
 		rf.matchIndex[server] = nextIndex - 1
 
-		DPrintf("[%v] %v's nextIndex is %v", rf.me, server, rf.nextIndex[server])
+		DPrintf("[%v] %v's matchIndex is %v", rf.me, server, rf.matchIndex[server])
 
 		// check matchIndex and update commitIndex only we remain the leader
 		for idx := rf.realNextIndex - 1; idx > rf.commitIndex; idx-- {
@@ -1055,7 +1076,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 					// update and check apply
 					rf.applierCh <- struct{}{}
 
-					DPrintf("[%v] leader commitIndex is %v", rf.me, idx)
+					DPrintf("[%v] leader commitIndex change to  %v", rf.me, idx)
 
 					return
 				}
@@ -1183,7 +1204,7 @@ func (rf *Raft) InitReplicator() {
 						rf.unlock("InitReplicator")
 
 						DPrintf("[%v] follower [%v] delay in [%v], send AppendEntries", rf.me, server, rf.nextIndex[server])
-						rf.doAppendEntries(server, args)
+						rf.doAppendEntries(server, args, nil, nil)
 
 					} else {
 						// send InstallSnapshot() RPC
@@ -1226,8 +1247,10 @@ func (rf *Raft) deleteDoneCh(name string) {
 
 	doneCh := rf.doneChPool[name]
 
-	close(doneCh)
-	delete(rf.doneChPool, name)
+	if doneCh != nil {
+		close(doneCh)
+		delete(rf.doneChPool, name)
+	}
 
 	DPrintf("[%v] channel %v has been closed", rf.me, name)
 }

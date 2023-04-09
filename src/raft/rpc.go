@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 // AppendEntries()
 type AppendEntriesArgs struct {
 	// information of this peer
@@ -16,6 +18,11 @@ type AppendEntriesReply struct {
 	Success bool
 	XTerm   int // the term of conflicting log , -1 if no conflict
 	XIndex  int // the first index of XTerm, -1 if no conflict
+}
+
+func (args *AppendEntriesArgs) String() string {
+	return fmt.Sprintf("AppendEntriesArgs{Term:%d, LeaderId:%d, Entries:%v, PrevLogIndex:%d, PrevLogTerm:%d, LeaderCommit:%d}",
+		args.Term, args.LeaderId, args.Entries, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
 }
 
 // InstallSnapshot()

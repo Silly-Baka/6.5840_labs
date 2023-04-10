@@ -41,6 +41,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	// get unique Id
 	ck.me = nrand()
 	ck.requestCh = make(chan RequestFuture)
+	ck.seq = 1
 
 	go ck.requestHandler()
 
@@ -67,7 +68,6 @@ func (ck *Clerk) requestHandler() {
 					Seq:         ck.seq + 1,
 				}
 				ck.seq++
-
 				ck.unlock("requestHandler_Get")
 
 				reply := GetReply{}
@@ -182,18 +182,18 @@ func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) {
 	lastLeader := ck.lastLeader
 	ck.unlock("SendGet")
 
-	DPrintf("[%v] client call get [%v] to server [%v]", ck.me, args.Key, lastLeader)
+	DPrintf("client call get [%v] to server [%v]", args.Key, lastLeader)
 	if ok := ck.servers[lastLeader].Call("KVServer.Get", args, reply); ok {
 		// have no err means that get value successfully
 		if reply.Err == OK || reply.Err == ErrNoKey {
-			DPrintf("[%v] client success get [%v]", ck.me, args.Key)
+			DPrintf("client success get [%v]", args.Key)
 			return
 		}
 	}
 	// retry until get value successfully
 	for {
 		for i, server := range ck.servers {
-			DPrintf("[%v] client call get [%v] to server [%v]", ck.me, args.Key, i)
+			DPrintf("client call get [%v] to server [%v]", args.Key, i)
 			if ok := server.Call("KVServer.Get", args, reply); ok {
 				// have no err means that get value successfully
 				if reply.Err == OK || reply.Err == ErrNoKey {
@@ -202,7 +202,7 @@ func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) {
 					ck.lastLeader = i
 					ck.unlock("sendGet")
 
-					DPrintf("[%v] client success get [%v]", ck.me, args.Key)
+					DPrintf("client success get [%v]", args.Key)
 
 					return
 				}
@@ -217,18 +217,18 @@ func (ck *Clerk) SendPutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	lastLeader := ck.lastLeader
 	ck.unlock("SendPutAppend")
 
-	DPrintf("[%v] client sending putAppend [%v:%v] to server [%v]", ck.me, args.Key, args.Value, lastLeader)
+	DPrintf("client sending putAppend [%v:%v] to server [%v]", args.Key, args.Value, lastLeader)
 	if ok := ck.servers[lastLeader].Call("KVServer.PutAppend", args, reply); ok {
 		// have no err means that get value successfully
 		if reply.Err == OK {
-			DPrintf("[%v] client success putAppend [%v:%v]", ck.me, args.Key, args.Value)
+			DPrintf("client success putAppend [%v:%v]", args.Key, args.Value)
 			return
 		}
 	}
 	// retry until get value successfully
 	for {
 		for i, server := range ck.servers {
-			DPrintf("[%v] client sending putAppend [%v:%v] to server [%v]", ck.me, args.Key, args.Value, i)
+			DPrintf("client sending putAppend [%v:%v] to server [%v]", args.Key, args.Value, i)
 			if ok := server.Call("KVServer.PutAppend", args, reply); ok {
 				// have no err means that get value successfully
 				if reply.Err == OK {
@@ -237,7 +237,7 @@ func (ck *Clerk) SendPutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 					ck.lastLeader = i
 					ck.unlock("SendPutAppend")
 
-					DPrintf("[%v] client success putAppend [%v]", ck.me, args.Key)
+					DPrintf("client success putAppend [%v]", args.Key)
 
 					return
 				}

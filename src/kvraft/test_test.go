@@ -483,9 +483,9 @@ func TestOnePartition3A(t *testing.T) {
 	ck := cfg.makeClient(cfg.All())
 
 	Put(cfg, ck, "1", "13", nil, -1)
-
 	cfg.begin("Test: progress in majority (3A)")
 
+	DPrintf("------making partition----------")
 	p1, p2 := cfg.make_partition()
 	cfg.partition(p1, p2)
 

@@ -206,6 +206,7 @@ func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) {
 
 					return
 				}
+				//
 			}
 		}
 		time.Sleep(20 * time.Millisecond)

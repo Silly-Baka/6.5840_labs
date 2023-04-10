@@ -40,11 +40,11 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	database        sync.Map // the map that maintain the key/value pair
-	doneChPool      map[string]chan interface{}
-	putAppendChPool map[int64]chan interface{}
-	lastApplied     int      // maintain the index that last applied
-	duplicateMap    sync.Map // map that record each client's last request
+	database   sync.Map // the map that maintain the key/value pair
+	doneChPool map[string]chan interface{}
+	//putAppendChPool map[int64]chan interface{}
+	lastApplied  int      // maintain the index that last applied
+	duplicateMap sync.Map // map that record each client's last request
 }
 
 type RequestRecord struct {
@@ -82,7 +82,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 	kv.rf.Start(opr)
 
-	DPrintf("[%v] server doing get [%v], seq is [%v]", kv.me, args.Key, args.Seq)
+	DPrintf("[%v] server doing get [%v], args is [%v], commitIndex is [%v]", kv.me, args.Key, args.CommitIndex, kv.rf.GetCommitIndex())
 	currentCommitIndex := kv.rf.GetCommitIndex()
 	if args.CommitIndex <= currentCommitIndex && kv.getLastApplied() >= currentCommitIndex {
 		v, ok := kv.database.Load(args.Key)
@@ -262,7 +262,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.doneChPool = make(map[string]chan interface{})
-	kv.putAppendChPool = make(map[int64]chan interface{})
+	//kv.putAppendChPool = make(map[int64]chan interface{})
 
 	kv.lastApplied = 0
 
@@ -289,7 +289,6 @@ func (kv *KVServer) handler() {
 				}
 
 				key := opr.Args[0]
-
 				getVal := ""
 
 				//DPrintf("111")
@@ -375,27 +374,28 @@ func (kv *KVServer) deleteDoneCh(name string) {
 	DPrintf("[%v] channel %v has been closed", kv.me, name)
 }
 
-func (kv *KVServer) createPutAppendCh(id int64) chan interface{} {
-	kv.lock("createPutAppendCh")
-	defer kv.unlock("createPutAppendCh")
-
-	ch := make(chan interface{}, 1)
-	kv.putAppendChPool[id] = ch
-
-	return ch
-}
-func (kv *KVServer) deletePutAppendCh(id int64) {
-	kv.lock("deletePutAppendCh")
-	defer kv.unlock("deletePutAppendCh")
-
-	ch := kv.putAppendChPool[id]
-
-	if ch != nil {
-		close(ch)
-		delete(kv.putAppendChPool, id)
-	}
-	DPrintf("[%v] channel %v has been closed", kv.me, id)
-}
+//
+//func (kv *KVServer) createPutAppendCh(id int64) chan interface{} {
+//	kv.lock("createPutAppendCh")
+//	defer kv.unlock("createPutAppendCh")
+//
+//	ch := make(chan interface{}, 1)
+//	kv.putAppendChPool[id] = ch
+//
+//	return ch
+//}
+//func (kv *KVServer) deletePutAppendCh(id int64) {
+//	kv.lock("deletePutAppendCh")
+//	defer kv.unlock("deletePutAppendCh")
+//
+//	ch := kv.putAppendChPool[id]
+//
+//	if ch != nil {
+//		close(ch)
+//		delete(kv.putAppendChPool, id)
+//	}
+//	DPrintf("[%v] channel %v has been closed", kv.me, id)
+//}
 
 func (kv *KVServer) getLastApplied() int {
 	kv.lock("getLastApplied")

@@ -12,12 +12,11 @@ type Clerk struct {
 	servers []*labrpc.ClientEnd
 
 	// You will have to modify this struct.
-	requestCh   chan RequestFuture // the channel that maintain the order of requests from one client
-	mu          sync.Mutex
-	commitIndex int
-	lastLeader  int
-	me          int64
-	seq         int // the sequence of request
+	requestCh  chan RequestFuture // the channel that maintain the order of requests from one client
+	mu         sync.Mutex
+	lastLeader int
+	me         int64
+	seq        int // the sequence of request
 }
 
 type RequestFuture struct {
@@ -60,12 +59,10 @@ func (ck *Clerk) requestHandler() {
 			case GET:
 				ck.lock("requestHandler_Get")
 
-				commitIndex := ck.commitIndex
 				args := GetArgs{
-					Key:         future.args[0],
-					CommitIndex: commitIndex,
-					ClientId:    ck.me,
-					Seq:         ck.seq + 1,
+					Key:      future.args[0],
+					ClientId: ck.me,
+					Seq:      ck.seq + 1,
 				}
 				ck.seq++
 				ck.unlock("requestHandler_Get")
@@ -73,12 +70,6 @@ func (ck *Clerk) requestHandler() {
 				reply := GetReply{}
 				// blocking and waiting for response
 				ck.SendGet(&args, &reply)
-
-				if reply.CommitIndex > commitIndex {
-					ck.lock("requestHandler_Get")
-					ck.commitIndex = reply.CommitIndex
-					ck.unlock("requestHandler_Get")
-				}
 
 				future.responseCh <- reply.Value
 			default:
@@ -97,12 +88,6 @@ func (ck *Clerk) requestHandler() {
 
 				// blocking and waiting for response
 				ck.SendPutAppend(&args, &reply)
-
-				ck.lock("requestHandler_PutAppend")
-				if reply.CommitIndex > ck.commitIndex {
-					ck.commitIndex = reply.CommitIndex
-				}
-				ck.unlock("requestHandler_PutAppend")
 
 				future.responseCh <- reply
 			}
@@ -193,6 +178,7 @@ func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) {
 	// retry until get value successfully
 	for {
 		for i, server := range ck.servers {
+
 			DPrintf("client call get [%v] to server [%v]", args.Key, i)
 			if ok := server.Call("KVServer.Get", args, reply); ok {
 				// have no err means that get value successfully
@@ -206,7 +192,6 @@ func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) {
 
 					return
 				}
-				//
 			}
 		}
 		time.Sleep(20 * time.Millisecond)

@@ -42,8 +42,7 @@ type KVServer struct {
 	// Your definitions here.
 	database     sync.Map // the map that maintain the key/value pair
 	doneChPool   map[string]chan interface{}
-	getChPool    map[int64]chan GetReply
-	lastApplied  int      // maintain the index that last applied
+	getChPool    map[int]chan GetReply
 	duplicateMap sync.Map // map that record each client's last request
 }
 
@@ -62,18 +61,25 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 
-	DPrintf("[%v] server doing get [%v]", kv.me, args.Key)
+	record := kv.getRequestRecord(args.ClientId)
+	if record != nil {
+		DPrintf("[%v] preRequest seq is [%v]", kv.me, record.seq)
+		// late request, will not be received
+		if args.Seq < record.seq {
+			reply.Err = ErrLateRequest
+			return
+		}
+		// request that has been executed, send the result
+		if args.Seq == record.seq {
+			reply.Err = record.err
+			reply.Value = record.value
 
-	requestRecord := kv.getRequestRecord(args.ClientId)
-	if requestRecord != nil && args.Seq <= requestRecord.seq {
-		reply.Err = OK
-		reply.Value = requestRecord.value
-		reply.CommitIndex = kv.rf.GetCommitIndex()
-
-		DPrintf("[%v] server get repeated get [%v]", kv.me, args.Key)
-
-		return
+			DPrintf("[%v] repeated get request, and return executed value", kv.me)
+			return
+		}
 	}
+
+	DPrintf("[%v] server doing get [%v], client is [%v] seq is [%v]", kv.me, args.Key, args.ClientId, args.Seq)
 
 	opr := Op{
 		Method:   GET,
@@ -81,22 +87,22 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 	}
-	kv.rf.Start(opr)
+	commitIndex, _, _ := kv.rf.Start(opr)
 
-	DPrintf("[%v] server doing get [%v], args is [%v], commitIndex is [%v]", kv.me, args.Key, args.CommitIndex, kv.rf.GetCommitIndex())
-
-	getCh := kv.createGetCh(args.ClientId)
-	defer kv.deleteGetCh(args.ClientId)
+	DPrintf("[%v] server doing get [%v], commitIndex is [%v]", kv.me, args.Key, kv.rf.GetCommitIndex())
 
 	cname := fmt.Sprintf("Get_%v", args.ClientId)
 	doneCh := kv.createDoneCh(cname)
 	defer kv.deleteDoneCh(cname)
 
-	timer := time.NewTimer(20 * time.Millisecond)
+	getCh := kv.createGetCh(commitIndex)
+	defer kv.createGetCh(commitIndex)
+
+	timer := time.NewTimer(GET_TIMEOUT)
 
 	select {
 
-	case r := <-getCh:
+	case res := <-getCh:
 
 		_, isLeader := kv.rf.GetState()
 		if !isLeader {
@@ -104,33 +110,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			return
 		}
 
-		reply.Err = r.Err
-		reply.Value = r.Value
-		reply.CommitIndex = kv.rf.GetCommitIndex()
+		reply.Err = res.Err
+		reply.Value = res.Value
 
 		return
 
 	case <-timer.C:
-		_, isLeader := kv.rf.GetState()
-		if !isLeader {
-			reply.Err = ErrWrongLeader
-			timer.Stop()
-
-			return
-		}
-		// check the duplicateTable
-		record := kv.getRequestRecord(args.ClientId)
-		if record != nil {
-			reply.Err = record.err
-			reply.Value = record.value
-			reply.CommitIndex = kv.rf.GetCommitIndex()
-
-			timer.Stop()
-
-			return
-		}
-		DPrintf("[%v] server checking get value", kv.me)
-		timer.Reset(20 * time.Millisecond)
+		// timeout and retry
+		reply.Err = ErrRetry
+		return
 
 	case <-doneCh:
 
@@ -149,15 +137,21 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	// repeated request
-	requestRecord := kv.getRequestRecord(args.ClientId)
-	if requestRecord != nil && args.Seq <= requestRecord.seq {
-		DPrintf("[%v] record seq is [%v]", kv.me, requestRecord.seq)
-		DPrintf("[%v] repeated put, seq is [%v]", kv.me, args.Seq)
+	// throw the repeated request
+	v, ok := kv.duplicateMap.Load(args.ClientId)
+	if ok {
+		record, _ := v.(RequestRecord)
+		// late request, will not be received
+		if args.Seq < record.seq {
+			reply.Err = ErrLateRequest
+			return
+		}
+		// request that has been executed, send the result
+		if args.Seq == record.seq {
+			reply.Err = record.err
 
-		reply.CommitIndex = kv.rf.GetCommitIndex()
-		reply.Err = OK
-		return
+			return
+		}
 	}
 
 	DPrintf("[%v] server doing %v [%v : %v], seq is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq)
@@ -181,7 +175,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// keep waiting until commit
 		currentCommitIndex := kv.rf.GetCommitIndex()
 		if currentCommitIndex >= commitIndex {
-			reply.CommitIndex = currentCommitIndex
 			reply.Err = OK
 			DPrintf("[%v] server success %v [%v : %v], commitIndex is [%v]", kv.me, args.Op, args.Key, args.Value, currentCommitIndex)
 
@@ -243,9 +236,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.doneChPool = make(map[string]chan interface{})
-	kv.getChPool = make(map[int64]chan GetReply)
-
-	kv.lastApplied = 0
+	kv.getChPool = make(map[int]chan GetReply)
 
 	go kv.handler()
 
@@ -264,75 +255,68 @@ func (kv *KVServer) handler() {
 			if applyMsg.CommandValid {
 				opr, _ := applyMsg.Command.(Op)
 
-				// throw the repeated log entry
-				if requestRecord := kv.getRequestRecord(opr.ClientId); requestRecord != nil && opr.Seq <= requestRecord.seq {
+				DPrintf("[%v] server get applyMsg, client is [%v] seq is [%v]", kv.me, opr.ClientId, opr.Seq)
+				// throw the repeated log
+				requestRecord := kv.getRequestRecord(opr.ClientId)
+				if requestRecord != nil && opr.Seq <= requestRecord.seq {
+
 					break
-				}
+				} else {
+					// only apply when the Seq larger
 
-				key := opr.Args[0]
-				getVal := ""
-				var err Err
+					key := opr.Args[0]
 
-				//DPrintf("111")
-				switch opr.Method {
+					var err Err
+					val := ""
 
-				case GET:
-					v, ok := kv.database.Load(key)
-					if !ok {
-						v = ""
-						err = ErrNoKey
-					} else {
+					switch opr.Method {
+
+					case GET:
+						v, ok := kv.database.Load(key)
+						if !ok {
+							v = ""
+							err = ErrNoKey
+						} else {
+							err = OK
+						}
+						val, _ = v.(string)
+
+					case PUT:
+						value := opr.Args[1]
+						kv.database.Store(key, value)
+						err = OK
+					case APPEND:
+						value := opr.Args[1]
+
+						v, ok := kv.database.Load(key)
+
+						strv, _ := v.(string)
+						if !ok {
+							kv.database.Store(key, value)
+						} else {
+							kv.database.Store(key, strv+value)
+						}
 						err = OK
 					}
-					getVal, _ = v.(string)
 
-					kv.lock("handler_Get")
-					if ch, ok := kv.getChPool[opr.ClientId]; ok {
-						kv.unlock("handler_Get")
+					kv.duplicateMap.Store(opr.ClientId, RequestRecord{
+						seq:   opr.Seq,
+						value: val,
+						err:   err,
+					})
 
-						defer func() {
-							if r := recover(); r != nil {
-								DPrintf("writing on closed channel")
-							}
-						}()
+					kv.lock("handler")
+					ch, ok := kv.getChPool[applyMsg.CommandIndex]
+					kv.unlock("handler")
+
+					if ok {
 						ch <- GetReply{
 							Err:   err,
-							Value: getVal,
+							Value: val,
 						}
-					} else {
-						kv.unlock("handler_Get")
 					}
-				case PUT:
-					value := opr.Args[1]
-					kv.database.Store(key, value)
-					err = OK
-				case APPEND:
-					value := opr.Args[1]
 
-					v, ok := kv.database.Load(key)
-
-					strv, _ := v.(string)
-					if !ok {
-						kv.database.Store(key, value)
-					} else {
-						kv.database.Store(key, strv+value)
-					}
-					err = OK
 				}
-
-				kv.lock("handler")
-				if applyMsg.CommandIndex > kv.lastApplied {
-					kv.lastApplied = applyMsg.CommandIndex
-				}
-				kv.unlock("handler")
-
-				kv.duplicateMap.Store(opr.ClientId, RequestRecord{
-					seq:   opr.Seq,
-					value: getVal,
-					err:   err,
-				})
-
-				DPrintf("[%v] server lastApplied is [%v], commitIndex is [%v]", kv.me, kv.lastApplied, kv.rf.GetCommitIndex())
 			}
 		case <-doneCh:
 			return
@@ -353,25 +337,25 @@ func (kv *KVServer) unlock(name string) {
 	}
 }
 
-func (kv *KVServer) createGetCh(clientId int64) chan GetReply {
+func (kv *KVServer) createGetCh(commitIndex int) chan GetReply {
 	kv.lock("createGetCh")
 	defer kv.unlock("createGetCh")
 
 	ch := make(chan GetReply)
-	kv.getChPool[clientId] = ch
+	kv.getChPool[commitIndex] = ch
 
 	return ch
 }
 
-func (kv *KVServer) deleteGetCh(clientId int64) {
+func (kv *KVServer) deleteGetCh(commitIndex int) {
 	kv.lock("deleteGetCh")
 	defer kv.unlock("deleteGetCh")
 
-	ch := kv.getChPool[clientId]
+	ch := kv.getChPool[commitIndex]
 
 	if ch != nil {
 		close(ch)
-		delete(kv.getChPool, clientId)
+		delete(kv.getChPool, commitIndex)
 	}
 }
 
@@ -399,36 +383,6 @@ func (kv *KVServer) deleteDoneCh(name string) {
 	}
 
 	DPrintf("[%v] channel %v has been closed", kv.me, name)
-}
-
-//
-//func (kv *KVServer) createPutAppendCh(id int64) chan interface{} {
-//	kv.lock("createPutAppendCh")
-//	defer kv.unlock("createPutAppendCh")
-//
-//	ch := make(chan interface{}, 1)
-//	kv.putAppendChPool[id] = ch
-//
-//	return ch
-//}
-//func (kv *KVServer) deletePutAppendCh(id int64) {
-//	kv.lock("deletePutAppendCh")
-//	defer kv.unlock("deletePutAppendCh")
-//
-//	ch := kv.putAppendChPool[id]
-//
-//	if ch != nil {
-//		close(ch)
-//		delete(kv.putAppendChPool, id)
-//	}
-//	DPrintf("[%v] channel %v has been closed", kv.me, id)
-//}
-
-func (kv *KVServer) getLastApplied() int {
-	kv.lock("getLastApplied")
-	defer kv.unlock("getLastApplied")
-
-	return kv.lastApplied
 }
 
 func (kv *KVServer) getRequestRecord(clientId int64) *RequestRecord {

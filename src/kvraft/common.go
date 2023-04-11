@@ -1,15 +1,21 @@
 package kvraft
 
+import "time"
+
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrRetry       = "Retry"
+	ErrLateRequest = "late"
 	CkLock         = false
 	KvLock         = true
 
 	GET    = "Get"
 	PUT    = "Put"
 	APPEND = "Append"
+
+	GET_TIMEOUT = 1000 * time.Millisecond
 )
 
 type Err string
@@ -34,13 +40,11 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
-	CommitIndex int
-	ClientId    int64
-	Seq         int
+	ClientId int64
+	Seq      int
 }
 
 type GetReply struct {
-	Err         Err
-	Value       string
-	CommitIndex int
+	Err   Err
+	Value string
 }

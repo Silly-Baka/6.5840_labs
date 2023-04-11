@@ -9,7 +9,7 @@ const (
 	ErrRetry       = "Retry"
 	ErrLateRequest = "late"
 	CkLock         = false
-	KvLock         = true
+	KvLock         = false
 
 	GET    = "Get"
 	PUT    = "Put"

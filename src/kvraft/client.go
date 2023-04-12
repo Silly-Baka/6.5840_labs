@@ -3,7 +3,6 @@ package kvraft
 import (
 	"6.5840/labrpc"
 	"sync"
-	"time"
 )
 import "crypto/rand"
 import "math/big"
@@ -67,9 +66,8 @@ func (ck *Clerk) requestHandler() {
 				ck.seq++
 				ck.unlock("requestHandler_Get")
 
-				reply := GetReply{}
 				// blocking and waiting for response
-				ck.SendGet(&args, &reply)
+				reply := ck.SendGet(&args)
 
 				future.responseCh <- reply.Value
 			default:
@@ -83,11 +81,10 @@ func (ck *Clerk) requestHandler() {
 					Seq:      ck.seq + 1,
 				}
 				ck.seq++
-				reply := PutAppendReply{}
 				ck.unlock("requestHandler_PutAppend")
 
 				// blocking and waiting for response
-				ck.SendPutAppend(&args, &reply)
+				reply := ck.SendPutAppend(&args)
 
 				future.responseCh <- reply
 			}
@@ -160,76 +157,62 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	}
 }
 
-func (ck *Clerk) SendGet(args *GetArgs, reply *GetReply) {
+func (ck *Clerk) SendGet(args *GetArgs) *GetReply {
 
-	// send to lastLeader first
+	// send to i first
 	ck.lock("SendGet")
-	lastLeader := ck.lastLeader
+	i := ck.lastLeader
 	ck.unlock("SendGet")
 
-	DPrintf("client call get [%v] to server [%v]", args.Key, lastLeader)
-	if ok := ck.servers[lastLeader].Call("KVServer.Get", args, reply); ok {
-		// have no err means that get value successfully
-		if reply.Err == OK || reply.Err == ErrNoKey {
-			DPrintf("client success get [%v]", args.Key)
-			return
-		}
-	}
+	l := len(ck.servers)
+
 	// retry until get value successfully
 	for {
-		for i, server := range ck.servers {
+		DPrintf("client call get [%v] to server [%v]", args.Key, i)
+		reply := GetReply{}
+		if ok := ck.servers[i].Call("KVServer.Get", args, &reply); ok {
+			// have no err means that get value successfully
+			if reply.Err == OK || reply.Err == ErrNoKey {
 
-			DPrintf("client call get [%v] to server [%v]", args.Key, i)
-			if ok := server.Call("KVServer.Get", args, reply); ok {
-				// have no err means that get value successfully
-				if reply.Err == OK || reply.Err == ErrNoKey {
+				ck.lock("SendGet")
+				ck.lastLeader = i
+				ck.unlock("sendGet")
 
-					ck.lock("SendGet")
-					ck.lastLeader = i
-					ck.unlock("sendGet")
+				DPrintf("client success get [%v]", args.Key)
 
-					DPrintf("client success get [%v]", args.Key)
-
-					return
-				}
+				return &reply
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		// retry, maybe timeout or wrong leader
+		i = (i + 1) % l
 	}
 }
-func (ck *Clerk) SendPutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+func (ck *Clerk) SendPutAppend(args *PutAppendArgs) *PutAppendReply {
 	// send to lastLeader first
 	ck.lock("SendPutAppend")
-	lastLeader := ck.lastLeader
+	i := ck.lastLeader
 	ck.unlock("SendPutAppend")
 
-	DPrintf("client sending putAppend [%v:%v] to server [%v]", args.Key, args.Value, lastLeader)
-	if ok := ck.servers[lastLeader].Call("KVServer.PutAppend", args, reply); ok {
-		// have no err means that get value successfully
-		if reply.Err == OK {
-			DPrintf("client success putAppend [%v:%v]", args.Key, args.Value)
-			return
-		}
-	}
+	l := len(ck.servers)
+
 	// retry until get value successfully
 	for {
-		for i, server := range ck.servers {
-			DPrintf("client sending putAppend [%v:%v] to server [%v]", args.Key, args.Value, i)
-			if ok := server.Call("KVServer.PutAppend", args, reply); ok {
-				// have no err means that get value successfully
-				if reply.Err == OK {
+		DPrintf("client sending putAppend [%v:%v] to server [%v]", args.Key, args.Value, i)
+		reply := PutAppendReply{}
+		if ok := ck.servers[i].Call("KVServer.PutAppend", args, &reply); ok {
+			// have no err means that get value successfully
+			if reply.Err == OK {
 
-					ck.lock("SendPutAppend")
-					ck.lastLeader = i
-					ck.unlock("SendPutAppend")
+				ck.lock("SendPutAppend")
+				ck.lastLeader = i
+				ck.unlock("SendPutAppend")
 
-					DPrintf("client success putAppend [%v]", args.Key)
+				DPrintf("client success putAppend [%v]", args.Key)
 
-					return
-				}
+				return &reply
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		i = (i + 1) % l
 	}
 }
 

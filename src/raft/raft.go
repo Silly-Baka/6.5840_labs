@@ -936,15 +936,13 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 	count := atomic.Int32{}
 	count.Store(0)
 
-	once := sync.Once{}
-
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
 		// if heartbeat, should send RPC immediately
 		if isHeartBeat {
-			go rf.doAppendEntries(i, args, &count, &once)
+			go rf.doAppendEntries(i, args)
 		}
 
 		//rf.mu.Lock()
@@ -962,7 +960,7 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 }
 
 // the real logic of heartbeat: send AppendEntries() to each peer if become leader
-func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs, count *atomic.Int32, once *sync.Once) {
+func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 
 	//rf.mu.Lock()
 	rf.lock("doAppendEntries")
@@ -1026,23 +1024,6 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs, count *atomi
 
 	DPrintf("[%v] peer %v reply is %v", rf.me, server, reply)
 	if reply.Success {
-
-		if count != nil {
-			count.Add(1)
-
-			// majority peer ack this heartbeat
-			if count.Load() > int32(len(rf.peers)/2) {
-				once.Do(func() {
-					rf.lock("countOnce")
-					for i := range rf.matchIndex {
-						rf.matchIndex[i] = args.PrevLogIndex
-					}
-					rf.commitIndex = args.PrevLogIndex
-					rf.unlock("countOnce")
-				})
-			}
-		}
-
 		//rf.mu.Lock()
 		rf.lock("doAppendEntries")
 		// defend another later heartbeat change it
@@ -1204,7 +1185,7 @@ func (rf *Raft) InitReplicator() {
 						rf.unlock("InitReplicator")
 
 						DPrintf("[%v] follower [%v] delay in [%v], send AppendEntries", rf.me, server, rf.nextIndex[server])
-						rf.doAppendEntries(server, args, nil, nil)
+						rf.doAppendEntries(server, args)
 
 					} else {
 						// send InstallSnapshot() RPC

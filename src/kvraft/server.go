@@ -4,20 +4,10 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
-
-const Debug = true
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug {
-		log.Printf(format, a...)
-	}
-	return
-}
 
 type Op struct {
 	// Your definitions here.
@@ -41,8 +31,8 @@ type KVServer struct {
 	// Your definitions here.
 	db           *DataBase
 	doneChPool   map[string]chan interface{}
-	duplicateMap map[int64]int // map that record each client's last Seq
-	recordChMap  map[int]chan RequestRecord
+	duplicateMap map[int64]int              // map that record each client's last Seq
+	waitingChMap map[int]chan RequestRecord // the map that record all the goroutines that waiting for command executed
 }
 
 type DataBase struct {
@@ -105,7 +95,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("[%v] server doing get [%v], commitIndex is [%v]", kv.me, args.Key, kv.rf.GetCommitIndex())
 
 	recordCh := kv.createRecordCh(commitIndex)
-	defer kv.createRecordCh(commitIndex)
+	defer kv.deleteRecordCh(commitIndex)
 
 	timer := time.NewTimer(RETRY_TIMEOUT)
 
@@ -127,7 +117,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	case <-timer.C:
 		// timeout and retry
-		reply.Err = ErrRetry
+		reply.Err = ErrTimeOut
 		return
 	}
 }
@@ -140,7 +130,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	DPrintf("[%v] server doing %v [%v : %v], seq is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq)
 	opr := Op{
 		Method:   args.Op,
 		Args:     []string{args.Key, args.Value},
@@ -148,31 +137,58 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Seq:      args.Seq,
 	}
 	commitIndex, term, _ := kv.rf.Start(opr)
+
+	DPrintf("[%v] server doing %v [%v : %v], seq is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq)
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
 		return
 	}
+	recordCh := kv.createRecordCh(commitIndex)
+	defer kv.deleteRecordCh(commitIndex)
 
-	// waiting for majority kvserver get this Op (has been committed)
-	for !kv.killed() {
+	timer := time.NewTimer(RETRY_TIMEOUT)
 
+	select {
+
+	case res := <-recordCh:
+
+		DPrintf("[%v] rpc handler get the result", kv.me)
 		_, isLeader := kv.rf.GetState()
 		if !isLeader {
 			reply.Err = ErrWrongLeader
 			return
 		}
 
-		// keep waiting until commit
-		currentCommitIndex := kv.rf.GetCommitIndex()
-		if currentCommitIndex >= commitIndex {
-			reply.Err = OK
-			DPrintf("[%v] server success %v [%v : %v], commitIndex is [%v]", kv.me, args.Op, args.Key, args.Value, currentCommitIndex)
+		reply.Err = res.err
 
-			return
-		}
+		return
 
-		time.Sleep(20 * time.Millisecond)
+	case <-timer.C:
+		// timeout and retry
+		reply.Err = ErrTimeOut
+		return
 	}
+
+	// waiting for majority kvserver get this Op (has been committed)
+	//for !kv.killed() {
+	//
+	//	_, isLeader := kv.rf.GetState()
+	//	if !isLeader {
+	//		reply.Err = ErrWrongLeader
+	//		return
+	//	}
+	//
+	//	// keep waiting until commit
+	//	currentCommitIndex := kv.rf.GetCommitIndex()
+	//	if currentCommitIndex >= commitIndex {
+	//		reply.Err = OK
+	//		DPrintf("[%v] server success %v [%v : %v], commitIndex is [%v]", kv.me, args.Op, args.Key, args.Value, currentCommitIndex)
+	//
+	//		return
+	//	}
+	//
+	//	time.Sleep(20 * time.Millisecond)
+	//}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -227,7 +243,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.doneChPool = make(map[string]chan interface{})
 	kv.duplicateMap = make(map[int64]int)
-	kv.recordChMap = make(map[int]chan RequestRecord)
+	kv.waitingChMap = make(map[int]chan RequestRecord)
 
 	db := new(DataBase)
 	db.data = make(map[string]string)
@@ -252,10 +268,20 @@ func (kv *KVServer) handler() {
 
 				res := kv.apply(opr)
 
-				if ch, ok := kv.recordChMap[applyMsg.CommandIndex]; ok {
+				kv.lock("handler")
+				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
+				kv.unlock("handler")
+				if ok {
+					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
+						break
+					}
+					defer func() {
+						if r := recover(); r != nil {
+							DPrintf("[%v] send on closed channel", kv.me)
+						}
+					}()
 					ch <- res
 				}
-
 			}
 		case <-doneCh:
 
@@ -313,20 +339,20 @@ func (kv *KVServer) createRecordCh(commitIndex int) chan RequestRecord {
 	defer kv.unlock("createRecordCh")
 
 	ch := make(chan RequestRecord)
-	kv.recordChMap[commitIndex] = ch
+	kv.waitingChMap[commitIndex] = ch
 
 	return ch
 }
 
 func (kv *KVServer) deleteRecordCh(commitIndex int) {
-	kv.lock("deleteGetCh")
-	defer kv.unlock("deleteGetCh")
+	kv.lock("deleteRecordCh")
+	defer kv.unlock("deleteRecordCh")
 
-	ch := kv.recordChMap[commitIndex]
+	ch := kv.waitingChMap[commitIndex]
 
 	if ch != nil {
+		delete(kv.waitingChMap, commitIndex)
 		close(ch)
-		delete(kv.recordChMap, commitIndex)
 	}
 }
 
@@ -349,8 +375,8 @@ func (kv *KVServer) deleteDoneCh(name string) {
 	doneCh := kv.doneChPool[name]
 
 	if doneCh != nil {
-		close(doneCh)
 		delete(kv.doneChPool, name)
+		close(doneCh)
 	}
 
 	DPrintf("[%v] channel %v has been closed", kv.me, name)

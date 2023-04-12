@@ -43,6 +43,8 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 
+	CommandTerm int
+
 	// For 2D:
 	SnapshotValid bool
 	Snapshot      []byte
@@ -693,6 +695,7 @@ func (rf *Raft) applier() {
 			commitIndex := rf.commitIndex
 			logicLastApplied := rf.realToLogic(lastApplied)
 			logicCommitIndex := rf.realToLogic(commitIndex)
+			currentTerm := rf.currentTerm
 
 			// have been snapshot, do not need to apply
 			if logicLastApplied < 0 {
@@ -712,6 +715,7 @@ func (rf *Raft) applier() {
 					CommandValid: true,
 					Command:      entry.Command,
 					CommandIndex: lastApplied + i + 1,
+					CommandTerm:  currentTerm,
 				}
 				//rf.applierCh <- applyMsg
 				rf.applyCh <- applyMsg

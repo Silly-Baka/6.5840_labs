@@ -1,13 +1,15 @@
 package kvraft
 
-import "time"
+import (
+	"log"
+	"time"
+)
 
 const (
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
-	ErrRetry       = "Retry"
-	ErrLateRequest = "late"
+	ErrTimeOut     = "timeout"
 	CkLock         = false
 	KvLock         = false
 
@@ -19,6 +21,15 @@ const (
 )
 
 type Err string
+
+const Debug = true
+
+func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if Debug {
+		log.Printf(format, a...)
+	}
+	return
+}
 
 // Put or Append
 type PutAppendArgs struct {

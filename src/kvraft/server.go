@@ -209,6 +209,10 @@ func (kv *KVServer) Kill() {
 	for _, ch := range kv.doneChPool {
 		ch <- true
 	}
+	for key, ch := range kv.waitingChMap {
+		delete(kv.waitingChMap, key)
+		close(ch)
+	}
 }
 
 func (kv *KVServer) killed() bool {

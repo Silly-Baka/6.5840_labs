@@ -214,8 +214,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		//rf.mu.Unlock()
-		//rf.unlock("InstallSnapshot")
 
 		return
 	}
@@ -586,6 +584,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	if rf.killed() || rf.state != Leader {
 		return 0, 0, false
 	}
+
 	// wrap the command into entry
 	NewEntry := LogEntry{
 		Term:    rf.currentTerm,
@@ -772,10 +771,15 @@ func (rf *Raft) NewElection() {
 		// request vote async
 		go func(server int) {
 
+			rf.lock("NewElection")
 			if rf.killed() || rf.state != Candidate {
+				rf.unlock("NewElection")
+
 				voteCh <- false
 				return
 			}
+			rf.unlock("NewElection")
+
 			reply := RequestVoteReply{}
 			//DPrintf("[%v] request vote to [%v]", rf.me, server)
 			if ok := rf.sendRequestVote(server, &args, &reply); !ok {
@@ -1059,7 +1063,9 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 					rf.unlock("doAppendEntries")
 
 					// update and check apply
-					rf.applierCh <- struct{}{}
+					go func() {
+						rf.applierCh <- struct{}{}
+					}()
 
 					DPrintf("[%v] leader commitIndex change to  %v", rf.me, idx)
 

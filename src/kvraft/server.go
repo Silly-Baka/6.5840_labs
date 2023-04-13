@@ -44,7 +44,6 @@ type KVServer struct {
 
 type DataBase struct {
 	Data map[string]string
-	mu   sync.Mutex
 }
 
 type RequestResult struct {
@@ -53,9 +52,6 @@ type RequestResult struct {
 }
 
 func (db *DataBase) Get(key string) (string, Err) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	val, ok := db.Data[key]
 	if !ok {
 		val = ""
@@ -65,16 +61,11 @@ func (db *DataBase) Get(key string) (string, Err) {
 }
 
 func (db *DataBase) Put(key string, value string) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
 
 	db.Data[key] = value
 }
 
 func (db *DataBase) Append(key string, value string) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
 	val, ok := db.Data[key]
 	if !ok {
 		val = ""
@@ -275,25 +266,25 @@ func (kv *KVServer) applier() {
 			if applyMsg.CommandValid {
 				opr, _ := applyMsg.Command.(Op)
 
-				kv.lock("applier")
+				kv.lock("applier1")
 				lastIncludedIndex := kv.LastIncludedIndex
-				kv.unlock("applier")
+				kv.unlock("applier1")
 
-				DPrintf("[%v] lastIncludedIndex is [%v]", kv.me, lastIncludedIndex)
+				DPrintf("[%v] commandIndex is [%v], lastIncludedIndex is [%v]", kv.me, applyMsg.CommandIndex, lastIncludedIndex)
 
 				// throw the repeated entries that included in the snapshot
 				if applyMsg.CommandIndex < lastIncludedIndex {
-					continue
+					break
 				}
 
 				res := kv.apply(opr)
 
-				kv.lock("applier")
+				kv.lock("applier2")
 				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
 
 				kv.LastIncludedIndex = applyMsg.CommandIndex
 
-				kv.unlock("applier")
+				kv.unlock("applier2")
 
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
@@ -303,7 +294,7 @@ func (kv *KVServer) applier() {
 
 					kv.deleteWaitingCh(applyMsg.CommandIndex)
 				}
-			} else if applyMsg.SnapshotValid {
+			} else if applyMsg.SnapshotValid && len(applyMsg.Snapshot) > 0 {
 				kv.restoreBySnapshot(applyMsg.Snapshot)
 			}
 		case <-doneCh:
@@ -326,24 +317,27 @@ func (kv *KVServer) apply(opr Op) RequestResult {
 
 	switch opr.Method {
 	case GET:
+		kv.lock("apply")
 		v, err := kv.DB.Get(opr.Args[0])
+		kv.unlock("apply")
+
 		result.err = err
 		result.value = v
 	case PUT:
 
 		if opr.Seq > maxSeq {
+			kv.lock("apply")
 			kv.DB.Put(opr.Args[0], opr.Args[1])
 
-			kv.lock("apply")
 			kv.DuplicateMap[opr.ClientId] = opr.Seq
 			kv.unlock("apply")
 		}
 		result.err = OK
 	case APPEND:
 		if opr.Seq > maxSeq {
+			kv.lock("apply")
 			kv.DB.Append(opr.Args[0], opr.Args[1])
 
-			kv.lock("apply")
 			kv.DuplicateMap[opr.ClientId] = opr.Seq
 			kv.unlock("apply")
 		}
@@ -383,13 +377,13 @@ func (kv *KVServer) snapshot() {
 	kv.lock("snapshot")
 	defer kv.unlock("snapshot")
 
+	DPrintf("[%v] snapshoting, lastInclude is [%v]", kv.me, kv.LastIncludedIndex)
+
 	buf := new(bytes.Buffer)
 
 	encoder := gob.NewEncoder(buf)
 
-	kv.DB.mu.Lock()
 	err := encoder.Encode(&kv.DB)
-	kv.DB.mu.Unlock()
 
 	if err != nil {
 		panic(fmt.Sprintf("[%v] snapshot error", kv.me))
@@ -412,6 +406,7 @@ func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
 	if decoder.Decode(&kv.DB) != nil ||
 		decoder.Decode(&kv.DuplicateMap) != nil ||
 		decoder.Decode(&kv.LastIncludedIndex) != nil {
+
 		panic(fmt.Sprintf("[%v] restore by snapshot error", kv.me))
 	}
 	DPrintf("[%v] restore lastApplied is [%v]", kv.me, kv.LastIncludedIndex)

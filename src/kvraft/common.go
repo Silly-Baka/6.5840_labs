@@ -11,7 +11,7 @@ const (
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrTimeOut     = "timeout"
 	CkLock         = false
-	KvLock         = false
+	KvLock         = true
 
 	GET    = "Get"
 	PUT    = "Put"

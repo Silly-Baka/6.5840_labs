@@ -32,14 +32,14 @@ type KVServer struct {
 	db           *DataBase
 	doneChPool   map[string]chan interface{}
 	duplicateMap map[int64]int              // map that record each client's last Seq
-	waitingChMap map[int]chan RequestRecord // the map that record all the goroutines that waiting for command executed
+	waitingChMap map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
 }
 
 type DataBase struct {
 	data map[string]string
 }
 
-type RequestRecord struct {
+type RequestResult struct {
 	value string
 	err   Err
 }
@@ -94,16 +94,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 
 	DPrintf("[%v] server doing get [%v], commitIndex is [%v]", kv.me, args.Key, kv.rf.GetCommitIndex())
 
-	recordCh := kv.createRecordCh(commitIndex)
-	defer kv.deleteRecordCh(commitIndex)
+	waitingCh := kv.createWaitingCh(commitIndex)
+	defer kv.deleteWaitingCh(commitIndex)
 
 	timer := time.NewTimer(RETRY_TIMEOUT)
 
 	select {
 
-	case res := <-recordCh:
+	case res := <-waitingCh:
 
-		DPrintf("[%v] rpc handler get the result", kv.me)
+		DPrintf("[%v] rpc applier get the result", kv.me)
 		_, isLeader := kv.rf.GetState()
 		if !isLeader {
 			reply.Err = ErrWrongLeader
@@ -121,6 +121,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 }
+
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
 
@@ -143,16 +144,16 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	recordCh := kv.createRecordCh(commitIndex)
-	defer kv.deleteRecordCh(commitIndex)
+	waitingCh := kv.createWaitingCh(commitIndex)
+	defer kv.deleteWaitingCh(commitIndex)
 
 	timer := time.NewTimer(RETRY_TIMEOUT)
 
 	select {
 
-	case res := <-recordCh:
+	case res := <-waitingCh:
 
-		DPrintf("[%v] rpc handler get the result", kv.me)
+		DPrintf("[%v] rpc applier get the result", kv.me)
 		_, isLeader := kv.rf.GetState()
 		if !isLeader {
 			reply.Err = ErrWrongLeader
@@ -168,27 +169,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		reply.Err = ErrTimeOut
 		return
 	}
-
-	// waiting for majority kvserver get this Op (has been committed)
-	//for !kv.killed() {
-	//
-	//	_, isLeader := kv.rf.GetState()
-	//	if !isLeader {
-	//		reply.Err = ErrWrongLeader
-	//		return
-	//	}
-	//
-	//	// keep waiting until commit
-	//	currentCommitIndex := kv.rf.GetCommitIndex()
-	//	if currentCommitIndex >= commitIndex {
-	//		reply.Err = OK
-	//		DPrintf("[%v] server success %v [%v : %v], commitIndex is [%v]", kv.me, args.Op, args.Key, args.Value, currentCommitIndex)
-	//
-	//		return
-	//	}
-	//
-	//	time.Sleep(20 * time.Millisecond)
-	//}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -247,21 +227,21 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.doneChPool = make(map[string]chan interface{})
 	kv.duplicateMap = make(map[int64]int)
-	kv.waitingChMap = make(map[int]chan RequestRecord)
+	kv.waitingChMap = make(map[int]chan RequestResult)
 
 	db := new(DataBase)
 	db.data = make(map[string]string)
 	kv.db = db
 
-	go kv.handler()
+	go kv.applier()
 
 	return kv
 }
 
-// handler that listen to applyCh and handle the command
-func (kv *KVServer) handler() {
-	doneCh := kv.createDoneCh("handler")
-	defer kv.deleteDoneCh("handler")
+// applier that listen to applyCh and handle the command
+func (kv *KVServer) applier() {
+	doneCh := kv.createDoneCh("applier")
+	defer kv.deleteDoneCh("applier")
 
 	for !kv.killed() {
 		select {
@@ -272,9 +252,9 @@ func (kv *KVServer) handler() {
 
 				res := kv.apply(opr)
 
-				kv.lock("handler")
+				kv.lock("applier")
 				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
-				kv.unlock("handler")
+				kv.unlock("applier")
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
 						break
@@ -289,40 +269,41 @@ func (kv *KVServer) handler() {
 			}
 		case <-doneCh:
 
-			DPrintf("[%v] server handler is dead", kv.me)
+			DPrintf("[%v] server applier is dead", kv.me)
 			return
 		}
 	}
-	DPrintf("[%v] server handler is dead", kv.me)
+	DPrintf("[%v] server applier is dead", kv.me)
 }
 
-func (kv *KVServer) apply(opr Op) RequestRecord {
+// the real logic of apply
+func (kv *KVServer) apply(opr Op) RequestResult {
 	// check if outdated
 	maxSeq := kv.duplicateMap[opr.ClientId]
 
-	record := RequestRecord{}
+	result := RequestResult{}
 
 	switch opr.Method {
 	case GET:
 		v, err := kv.db.Get(opr.Args[0])
-		record.err = err
-		record.value = v
+		result.err = err
+		result.value = v
 	case PUT:
 
 		if opr.Seq > maxSeq {
 			kv.db.Put(opr.Args[0], opr.Args[1])
 			kv.duplicateMap[opr.ClientId] = opr.Seq
 		}
-		record.err = OK
+		result.err = OK
 	case APPEND:
 		if opr.Seq > maxSeq {
 			kv.db.Append(opr.Args[0], opr.Args[1])
 			kv.duplicateMap[opr.ClientId] = opr.Seq
 		}
-		record.err = OK
+		result.err = OK
 	}
 
-	return record
+	return result
 }
 
 func (kv *KVServer) lock(name string) {
@@ -338,19 +319,19 @@ func (kv *KVServer) unlock(name string) {
 	}
 }
 
-func (kv *KVServer) createRecordCh(commitIndex int) chan RequestRecord {
-	kv.lock("createRecordCh")
-	defer kv.unlock("createRecordCh")
+func (kv *KVServer) createWaitingCh(commitIndex int) chan RequestResult {
+	kv.lock("createWaitingCh")
+	defer kv.unlock("createWaitingCh")
 
-	ch := make(chan RequestRecord)
+	ch := make(chan RequestResult)
 	kv.waitingChMap[commitIndex] = ch
 
 	return ch
 }
 
-func (kv *KVServer) deleteRecordCh(commitIndex int) {
-	kv.lock("deleteRecordCh")
-	defer kv.unlock("deleteRecordCh")
+func (kv *KVServer) deleteWaitingCh(commitIndex int) {
+	kv.lock("deleteWaitingCh")
+	defer kv.unlock("deleteWaitingCh")
 
 	ch := kv.waitingChMap[commitIndex]
 
@@ -385,22 +366,3 @@ func (kv *KVServer) deleteDoneCh(name string) {
 
 	DPrintf("[%v] channel %v has been closed", kv.me, name)
 }
-
-//
-//func (kv *KVServer) getRequestRecord(clientId int64) *RequestRecord {
-//	//v, ok := kv.duplicateMap.Load(clientId)
-//	//if ok {
-//	//	record, _ := v.(RequestRecord)
-//	//	return &record
-//	//}
-//	//return nil
-//	kv.lock("getRequestRecord")
-//	record, ok := kv.duplicateMap[clientId]
-//	kv.unlock("getRequestRecord")
-//
-//	if ok {
-//		return &record
-//	} else {
-//		return nil
-//	}
-//}

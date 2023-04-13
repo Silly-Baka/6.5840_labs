@@ -94,7 +94,7 @@ func (ck *Clerk) requestHandler() {
 // ok := ck.servers[i].Call("KVServer.Get", &Args, &reply)
 //
 // the types of Args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
+// must match the declared types of the RPC applier function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
 	// You will have to modify this function.
@@ -128,7 +128,7 @@ func (ck *Clerk) Get(key string) string {
 // ok := ck.servers[i].Call("KVServer.PutAppend", &Args, &reply)
 //
 // the types of Args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
+// must match the declared types of the RPC applier function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.

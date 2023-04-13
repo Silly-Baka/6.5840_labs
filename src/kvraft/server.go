@@ -39,11 +39,12 @@ type KVServer struct {
 	waitingChMap map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
 
 	// 3B
-	LastApplied int
+	LastIncludedIndex int
 }
 
 type DataBase struct {
 	Data map[string]string
+	mu   sync.Mutex
 }
 
 type RequestResult struct {
@@ -52,6 +53,9 @@ type RequestResult struct {
 }
 
 func (db *DataBase) Get(key string) (string, Err) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	val, ok := db.Data[key]
 	if !ok {
 		val = ""
@@ -61,10 +65,16 @@ func (db *DataBase) Get(key string) (string, Err) {
 }
 
 func (db *DataBase) Put(key string, value string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	db.Data[key] = value
 }
 
 func (db *DataBase) Append(key string, value string) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
 	val, ok := db.Data[key]
 	if !ok {
 		val = ""
@@ -102,7 +112,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("[%v] server doing get [%v], commitIndex is [%v]", kv.me, args.Key, kv.rf.GetCommitIndex())
 
 	waitingCh := kv.createWaitingCh(commitIndex)
-	defer kv.deleteWaitingCh(commitIndex)
+	//defer kv.deleteWaitingCh(commitIndex)
 
 	timer := time.NewTimer(RETRY_TIMEOUT)
 
@@ -152,7 +162,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 	waitingCh := kv.createWaitingCh(commitIndex)
-	defer kv.deleteWaitingCh(commitIndex)
+	//defer kv.deleteWaitingCh(commitIndex)
 
 	timer := time.NewTimer(RETRY_TIMEOUT)
 
@@ -196,10 +206,6 @@ func (kv *KVServer) Kill() {
 	for _, ch := range kv.doneChPool {
 		ch <- true
 	}
-	for key, ch := range kv.waitingChMap {
-		delete(kv.waitingChMap, key)
-		close(ch)
-	}
 }
 
 func (kv *KVServer) killed() bool {
@@ -240,7 +246,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	db := new(DataBase)
 	db.Data = make(map[string]string)
 	kv.DB = db
-	kv.LastApplied = 0
+	kv.LastIncludedIndex = 0
 
 	// todo
 	snapshot := kv.rf.Persister.ReadSnapshot()
@@ -269,32 +275,36 @@ func (kv *KVServer) applier() {
 			if applyMsg.CommandValid {
 				opr, _ := applyMsg.Command.(Op)
 
+				kv.lock("applier")
+				lastIncludedIndex := kv.LastIncludedIndex
+				kv.unlock("applier")
+
+				DPrintf("[%v] lastIncludedIndex is [%v]", kv.me, lastIncludedIndex)
+
+				// throw the repeated entries that included in the snapshot
+				if applyMsg.CommandIndex < lastIncludedIndex {
+					continue
+				}
+
 				res := kv.apply(opr)
 
 				kv.lock("applier")
 				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
 
-				kv.LastApplied = applyMsg.CommandIndex
+				kv.LastIncludedIndex = applyMsg.CommandIndex
+
 				kv.unlock("applier")
+
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
 						break
 					}
-					defer func() {
-						if r := recover(); r != nil {
-							DPrintf("[%v] send on closed channel", kv.me)
-						}
-					}()
 					ch <- res
+
+					kv.deleteWaitingCh(applyMsg.CommandIndex)
 				}
 			} else if applyMsg.SnapshotValid {
-				kv.lock("applier")
-				lastApplied := kv.LastApplied
-				kv.unlock("applier")
-
-				if lastApplied < applyMsg.SnapshotIndex {
-					kv.restoreBySnapshot(applyMsg.Snapshot)
-				}
+				kv.restoreBySnapshot(applyMsg.Snapshot)
 			}
 		case <-doneCh:
 
@@ -377,13 +387,20 @@ func (kv *KVServer) snapshot() {
 
 	encoder := gob.NewEncoder(buf)
 
-	if encoder.Encode(&kv.DB) != nil ||
-		encoder.Encode(&kv.DuplicateMap) != nil ||
-		encoder.Encode(&kv.LastApplied) != nil {
+	kv.DB.mu.Lock()
+	err := encoder.Encode(&kv.DB)
+	kv.DB.mu.Unlock()
+
+	if err != nil {
 		panic(fmt.Sprintf("[%v] snapshot error", kv.me))
 	}
 
-	kv.rf.Snapshot(kv.LastApplied, buf.Bytes())
+	if encoder.Encode(&kv.DuplicateMap) != nil ||
+		encoder.Encode(&kv.LastIncludedIndex) != nil {
+		panic(fmt.Sprintf("[%v] snapshot error", kv.me))
+	}
+
+	kv.rf.Snapshot(kv.LastIncludedIndex, buf.Bytes())
 }
 
 func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
@@ -394,9 +411,10 @@ func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
 
 	if decoder.Decode(&kv.DB) != nil ||
 		decoder.Decode(&kv.DuplicateMap) != nil ||
-		decoder.Decode(&kv.LastApplied) != nil {
+		decoder.Decode(&kv.LastIncludedIndex) != nil {
 		panic(fmt.Sprintf("[%v] restore by snapshot error", kv.me))
 	}
+	DPrintf("[%v] restore lastApplied is [%v]", kv.me, kv.LastIncludedIndex)
 }
 
 func (kv *KVServer) lock(name string) {

@@ -182,7 +182,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	defer rf.unlock("Snapshot")
 
 	if index >= rf.realNextIndex {
-		panic("the snapshot error")
+		panic(fmt.Sprintf("[%v] the snapshot error, lastInclude is [%v], realNext is [%v]", rf.me, index, rf.realNextIndex))
 	}
 	// ignore the repeated/delay snapshot
 	if index <= rf.lastIncludedIndex {
@@ -990,7 +990,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 	DPrintf("[%v] send heartbeat to [%v], args: [%v]", rf.me, server, args.String())
 	reply := AppendEntriesReply{}
 
-	DPrintf("[%v] realNextIndex is [%v], lastIncludedIndex is [%v]", rf.me, rf.realNextIndex, rf.lastIncludedIndex)
+	//DPrintf("[%v] realNextIndex is [%v], lastIncludedIndex is [%v]", rf.me, rf.realNextIndex, rf.lastIncludedIndex)
 	DPrintf("[%v] appendEntries to [%v] is [%v]", rf.me, server, args)
 
 	if ok := rf.sendAppendEntries(server, &args, &reply); !ok {
@@ -1160,7 +1160,9 @@ func (rf *Raft) InitReplicator() {
 			doneCh := rf.createDoneCh(name)
 			defer rf.deleteDoneCh(name)
 
+			rf.lock("InitReplicator")
 			rf.replicatorChPool[server] = make(chan AppendEntriesArgs, 1000)
+			rf.unlock("InitReplicator")
 
 			for {
 				select {
@@ -1188,7 +1190,7 @@ func (rf *Raft) InitReplicator() {
 						//rf.mu.Unlock()
 						rf.unlock("InitReplicator")
 
-						DPrintf("[%v] follower [%v] delay in [%v], send AppendEntries", rf.me, server, rf.nextIndex[server])
+						//DPrintf("[%v] follower [%v] delay in [%v], send AppendEntries", rf.me, server, rf.nextIndex[server])
 						rf.doAppendEntries(server, args)
 
 					} else {

@@ -4,6 +4,9 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
+	"encoding/gob"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -29,14 +32,18 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	db           *DataBase
+	// 3A
+	DB           *DataBase
 	doneChPool   map[string]chan interface{}
-	duplicateMap map[int64]int              // map that record each client's last Seq
+	DuplicateMap map[int64]int              // map that record each client's last Seq
 	waitingChMap map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
+
+	// 3B
+	LastApplied int
 }
 
 type DataBase struct {
-	data map[string]string
+	Data map[string]string
 }
 
 type RequestResult struct {
@@ -45,7 +52,7 @@ type RequestResult struct {
 }
 
 func (db *DataBase) Get(key string) (string, Err) {
-	val, ok := db.data[key]
+	val, ok := db.Data[key]
 	if !ok {
 		val = ""
 		return val, ErrNoKey
@@ -54,17 +61,17 @@ func (db *DataBase) Get(key string) (string, Err) {
 }
 
 func (db *DataBase) Put(key string, value string) {
-	db.data[key] = value
+	db.Data[key] = value
 }
 
 func (db *DataBase) Append(key string, value string) {
-	val, ok := db.data[key]
+	val, ok := db.Data[key]
 	if !ok {
 		val = ""
 	}
 	val += value
 
-	db.data[key] = val
+	db.Data[key] = val
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -223,17 +230,29 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
+	// 3A
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.doneChPool = make(map[string]chan interface{})
-	kv.duplicateMap = make(map[int64]int)
+	kv.DuplicateMap = make(map[int64]int)
 	kv.waitingChMap = make(map[int]chan RequestResult)
 
 	db := new(DataBase)
-	db.data = make(map[string]string)
-	kv.db = db
+	db.Data = make(map[string]string)
+	kv.DB = db
+	kv.LastApplied = 0
+
+	// todo
+	snapshot := kv.rf.Persister.ReadSnapshot()
+	if len(snapshot) > 0 {
+		kv.restoreBySnapshot(snapshot)
+	}
 
 	go kv.applier()
+
+	if maxraftstate != -1 {
+		go kv.snapshoter()
+	}
 
 	return kv
 }
@@ -254,6 +273,8 @@ func (kv *KVServer) applier() {
 
 				kv.lock("applier")
 				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
+
+				kv.LastApplied = applyMsg.CommandIndex
 				kv.unlock("applier")
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
@@ -265,6 +286,14 @@ func (kv *KVServer) applier() {
 						}
 					}()
 					ch <- res
+				}
+			} else if applyMsg.SnapshotValid {
+				kv.lock("applier")
+				lastApplied := kv.LastApplied
+				kv.unlock("applier")
+
+				if lastApplied < applyMsg.SnapshotIndex {
+					kv.restoreBySnapshot(applyMsg.Snapshot)
 				}
 			}
 		case <-doneCh:
@@ -279,31 +308,95 @@ func (kv *KVServer) applier() {
 // the real logic of apply
 func (kv *KVServer) apply(opr Op) RequestResult {
 	// check if outdated
-	maxSeq := kv.duplicateMap[opr.ClientId]
+	kv.lock("apply")
+	maxSeq := kv.DuplicateMap[opr.ClientId]
+	kv.unlock("apply")
 
 	result := RequestResult{}
 
 	switch opr.Method {
 	case GET:
-		v, err := kv.db.Get(opr.Args[0])
+		v, err := kv.DB.Get(opr.Args[0])
 		result.err = err
 		result.value = v
 	case PUT:
 
 		if opr.Seq > maxSeq {
-			kv.db.Put(opr.Args[0], opr.Args[1])
-			kv.duplicateMap[opr.ClientId] = opr.Seq
+			kv.DB.Put(opr.Args[0], opr.Args[1])
+
+			kv.lock("apply")
+			kv.DuplicateMap[opr.ClientId] = opr.Seq
+			kv.unlock("apply")
 		}
 		result.err = OK
 	case APPEND:
 		if opr.Seq > maxSeq {
-			kv.db.Append(opr.Args[0], opr.Args[1])
-			kv.duplicateMap[opr.ClientId] = opr.Seq
+			kv.DB.Append(opr.Args[0], opr.Args[1])
+
+			kv.lock("apply")
+			kv.DuplicateMap[opr.ClientId] = opr.Seq
+			kv.unlock("apply")
 		}
 		result.err = OK
 	}
 
 	return result
+}
+
+// the goroutine that listen to the snapshot checkpoint
+func (kv *KVServer) snapshoter() {
+	doneCh := kv.createDoneCh("snapshoter")
+	defer kv.deleteDoneCh("snapshoter")
+
+	ticker := time.NewTicker(SNAPSHOT_CHECKTIME)
+
+	for {
+		select {
+		case <-ticker.C:
+
+			// check whether we should snapshot
+			if kv.rf.Persister.RaftStateSize() >= kv.maxraftstate {
+				kv.snapshot()
+			}
+
+		case <-doneCh:
+
+			ticker.Stop()
+
+			return
+		}
+	}
+}
+
+// real logic of snapshot, encode state to []byte
+func (kv *KVServer) snapshot() {
+	kv.lock("snapshot")
+	defer kv.unlock("snapshot")
+
+	buf := new(bytes.Buffer)
+
+	encoder := gob.NewEncoder(buf)
+
+	if encoder.Encode(&kv.DB) != nil ||
+		encoder.Encode(&kv.DuplicateMap) != nil ||
+		encoder.Encode(&kv.LastApplied) != nil {
+		panic(fmt.Sprintf("[%v] snapshot error", kv.me))
+	}
+
+	kv.rf.Snapshot(kv.LastApplied, buf.Bytes())
+}
+
+func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
+	kv.lock("restoreBySnapshot")
+	defer kv.unlock("restoreBySnapshot")
+
+	decoder := gob.NewDecoder(bytes.NewBuffer(snapshot))
+
+	if decoder.Decode(&kv.DB) != nil ||
+		decoder.Decode(&kv.DuplicateMap) != nil ||
+		decoder.Decode(&kv.LastApplied) != nil {
+		panic(fmt.Sprintf("[%v] restore by snapshot error", kv.me))
+	}
 }
 
 func (kv *KVServer) lock(name string) {

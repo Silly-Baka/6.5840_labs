@@ -17,8 +17,8 @@ const (
 	PUT    = "Put"
 	APPEND = "Append"
 
-	RETRY_TIMEOUT      = 1000 * time.Millisecond
-	SNAPSHOT_CHECKTIME = 50 * time.Millisecond
+	RETRY_TIMEOUT      = 500 * time.Millisecond
+	SNAPSHOT_CHECKTIME = 80 * time.Millisecond
 )
 
 type Err string

@@ -196,7 +196,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.logicNextIndex = len(rf.log)
 	rf.snapshot = snapshot
 
-	if index > rf.commitIndex {
+	if index >= rf.commitIndex {
 		rf.lastApplied = index
 		rf.commitIndex = index
 	}
@@ -578,7 +578,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	//rf.mu.Lock()
 	rf.lock("Start")
-	//defer rf.mu.Unlock()
 	defer rf.unlock("Start")
 
 	if rf.killed() || rf.state != Leader {
@@ -594,8 +593,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := rf.realNextIndex
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
-	rf.realNextIndex++
-	rf.logicNextIndex++
+	rf.realNextIndex += 1
+	rf.logicNextIndex += 1
 
 	rf.persist()
 
@@ -687,7 +686,7 @@ func (rf *Raft) applier() {
 			if rf.lastApplied >= rf.commitIndex {
 				//rf.mu.Unlock()
 				rf.unlock("applier")
-				break
+				continue
 			}
 
 			lastApplied := rf.lastApplied
@@ -700,7 +699,7 @@ func (rf *Raft) applier() {
 			if logicLastApplied < 0 {
 				//rf.mu.Unlock()
 				rf.unlock("applier")
-				return
+				continue
 			}
 
 			entries := append([]LogEntry{}, rf.log[logicLastApplied+1:logicCommitIndex+1]...)
@@ -1063,9 +1062,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 					rf.unlock("doAppendEntries")
 
 					// update and check apply
-					go func() {
-						rf.applierCh <- struct{}{}
-					}()
+					rf.applierCh <- struct{}{}
 
 					DPrintf("[%v] leader commitIndex change to  %v", rf.me, idx)
 
@@ -1143,7 +1140,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// 2D
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
-	rf.applierCh = make(chan interface{}, 1)
+	rf.applierCh = make(chan interface{})
 
 	// 2C
 	// initialize from state persisted before a crash

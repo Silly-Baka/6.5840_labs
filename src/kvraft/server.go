@@ -38,7 +38,7 @@ type KVServer struct {
 	DuplicateMap map[int64]int              // map that record each client's last Seq
 	waitingChMap map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
 
-	// 3B
+	//
 	LastIncludedIndex int
 }
 
@@ -147,11 +147,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	commitIndex, term, _ := kv.rf.Start(opr)
 
-	DPrintf("[%v] server doing %v [%v : %v], seq is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq)
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
 		return
 	}
+
+	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commitIndex)
+
 	waitingCh := kv.createWaitingCh(commitIndex)
 	//defer kv.deleteWaitingCh(commitIndex)
 
@@ -190,6 +192,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
+
 	// Your code here, if desired.
 	kv.lock("Kill")
 	defer kv.unlock("Kill")
@@ -220,6 +223,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(DataBase{})
 
 	kv := new(KVServer)
 	kv.me = me
@@ -237,6 +241,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	db := new(DataBase)
 	db.Data = make(map[string]string)
 	kv.DB = db
+
 	kv.LastIncludedIndex = 0
 
 	// todo
@@ -247,9 +252,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	go kv.applier()
 
-	if maxraftstate != -1 {
-		go kv.snapshoter()
-	}
+	//if maxraftstate != -1 {
+	//	go kv.snapshoter()
+	//}
 
 	return kv
 }
@@ -259,44 +264,56 @@ func (kv *KVServer) applier() {
 	doneCh := kv.createDoneCh("applier")
 	defer kv.deleteDoneCh("applier")
 
+	ticker := time.NewTicker(SNAPSHOT_CHECKTIME)
+
+	if kv.maxraftstate == -1 {
+		ticker.Stop()
+	}
+
 	for !kv.killed() {
 		select {
 		case applyMsg := <-kv.applyCh:
 
+			DPrintf("[%v] server get applyIndex is [%v]", kv.me, applyMsg.CommandIndex)
+
 			if applyMsg.CommandValid {
 				opr, _ := applyMsg.Command.(Op)
 
-				kv.lock("applier1")
-				lastIncludedIndex := kv.LastIncludedIndex
-				kv.unlock("applier1")
-
-				DPrintf("[%v] commandIndex is [%v], lastIncludedIndex is [%v]", kv.me, applyMsg.CommandIndex, lastIncludedIndex)
-
-				// throw the repeated entries that included in the snapshot
-				if applyMsg.CommandIndex < lastIncludedIndex {
-					break
-				}
-
 				res := kv.apply(opr)
 
-				kv.lock("applier2")
+				DPrintf("[%v] success handler command [%v]", kv.me, applyMsg.CommandIndex)
+
+				if applyMsg.CommandIndex > kv.LastIncludedIndex {
+					kv.LastIncludedIndex = applyMsg.CommandIndex
+				}
+
+				kv.lock("applier")
 				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
-
-				kv.LastIncludedIndex = applyMsg.CommandIndex
-
-				kv.unlock("applier2")
+				kv.unlock("applier")
 
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
 						break
 					}
+					DPrintf("[%v] send res to chan", kv.me)
 					ch <- res
 
 					kv.deleteWaitingCh(applyMsg.CommandIndex)
 				}
-			} else if applyMsg.SnapshotValid && len(applyMsg.Snapshot) > 0 {
+
+			} else if applyMsg.SnapshotValid && applyMsg.SnapshotIndex > kv.LastIncludedIndex {
+
+				DPrintf("[%v] get snapshot [%v]", kv.me, applyMsg.SnapshotIndex)
 				kv.restoreBySnapshot(applyMsg.Snapshot)
+				kv.LastIncludedIndex = applyMsg.SnapshotIndex
 			}
+
+		case <-ticker.C:
+			// check whether we should snapshot
+			if kv.rf.Persister.RaftStateSize() >= kv.maxraftstate {
+				kv.snapshot()
+			}
+
 		case <-doneCh:
 
 			DPrintf("[%v] server applier is dead", kv.me)
@@ -309,37 +326,26 @@ func (kv *KVServer) applier() {
 // the real logic of apply
 func (kv *KVServer) apply(opr Op) RequestResult {
 	// check if outdated
-	kv.lock("apply")
 	maxSeq := kv.DuplicateMap[opr.ClientId]
-	kv.unlock("apply")
 
 	result := RequestResult{}
 
 	switch opr.Method {
 	case GET:
-		kv.lock("apply")
 		v, err := kv.DB.Get(opr.Args[0])
-		kv.unlock("apply")
-
 		result.err = err
 		result.value = v
+
 	case PUT:
-
 		if opr.Seq > maxSeq {
-			kv.lock("apply")
 			kv.DB.Put(opr.Args[0], opr.Args[1])
-
 			kv.DuplicateMap[opr.ClientId] = opr.Seq
-			kv.unlock("apply")
 		}
 		result.err = OK
 	case APPEND:
 		if opr.Seq > maxSeq {
-			kv.lock("apply")
 			kv.DB.Append(opr.Args[0], opr.Args[1])
-
 			kv.DuplicateMap[opr.ClientId] = opr.Seq
-			kv.unlock("apply")
 		}
 		result.err = OK
 	}
@@ -348,49 +354,38 @@ func (kv *KVServer) apply(opr Op) RequestResult {
 }
 
 // the goroutine that listen to the snapshot checkpoint
-func (kv *KVServer) snapshoter() {
-	doneCh := kv.createDoneCh("snapshoter")
-	defer kv.deleteDoneCh("snapshoter")
-
-	ticker := time.NewTicker(SNAPSHOT_CHECKTIME)
-
-	for {
-		select {
-		case <-ticker.C:
-
-			// check whether we should snapshot
-			if kv.rf.Persister.RaftStateSize() >= kv.maxraftstate {
-				kv.snapshot()
-			}
-
-		case <-doneCh:
-
-			ticker.Stop()
-
-			return
-		}
-	}
-}
+//func (kv *KVServer) snapshoter() {
+//	doneCh := kv.createDoneCh("snapshoter")
+//	defer kv.deleteDoneCh("snapshoter")
+//
+//	ticker := time.NewTicker(SNAPSHOT_CHECKTIME)
+//
+//	for {
+//		select {
+//		case <-ticker.C:
+//
+//			// check whether we should snapshot
+//			if kv.rf.Persister.RaftStateSize() >= kv.maxraftstate {
+//				kv.snapshot()
+//			}
+//
+//		case <-doneCh:
+//
+//			ticker.Stop()
+//
+//			return
+//		}
+//	}
+//}
 
 // real logic of snapshot, encode state to []byte
 func (kv *KVServer) snapshot() {
-	kv.lock("snapshot")
-	defer kv.unlock("snapshot")
 
-	DPrintf("[%v] snapshoting, lastInclude is [%v]", kv.me, kv.LastIncludedIndex)
-
+	DPrintf("[%v] server is snapshotting", kv.me)
 	buf := new(bytes.Buffer)
-
 	encoder := gob.NewEncoder(buf)
 
-	err := encoder.Encode(&kv.DB)
-
-	if err != nil {
-		panic(fmt.Sprintf("[%v] snapshot error", kv.me))
-	}
-
-	if encoder.Encode(&kv.DuplicateMap) != nil ||
-		encoder.Encode(&kv.LastIncludedIndex) != nil {
+	if encoder.Encode(&kv.DB) != nil || encoder.Encode(&kv.DuplicateMap) != nil {
 		panic(fmt.Sprintf("[%v] snapshot error", kv.me))
 	}
 
@@ -398,18 +393,14 @@ func (kv *KVServer) snapshot() {
 }
 
 func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
-	kv.lock("restoreBySnapshot")
-	defer kv.unlock("restoreBySnapshot")
 
 	decoder := gob.NewDecoder(bytes.NewBuffer(snapshot))
 
 	if decoder.Decode(&kv.DB) != nil ||
-		decoder.Decode(&kv.DuplicateMap) != nil ||
-		decoder.Decode(&kv.LastIncludedIndex) != nil {
+		decoder.Decode(&kv.DuplicateMap) != nil {
 
 		panic(fmt.Sprintf("[%v] restore by snapshot error", kv.me))
 	}
-	DPrintf("[%v] restore lastApplied is [%v]", kv.me, kv.LastIncludedIndex)
 }
 
 func (kv *KVServer) lock(name string) {

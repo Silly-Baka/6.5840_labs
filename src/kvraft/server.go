@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/gob"
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -105,7 +106,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	waitingCh := kv.createWaitingCh(commandIndex)
 	defer kv.deleteWaitingCh(commandIndex)
 
-	timer := time.NewTimer(RETRY_TIMEOUT)
+	timer := time.NewTimer(getRetryTimeout())
 
 	select {
 
@@ -154,12 +155,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	//DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v], realNextIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex, kv.rf.GetRealNextIndex())
+	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex)
 
 	waitingCh := kv.createWaitingCh(commandIndex)
 	defer kv.deleteWaitingCh(commandIndex)
 
-	timer := time.NewTimer(RETRY_TIMEOUT)
+	timer := time.NewTimer(getRetryTimeout())
 
 	select {
 
@@ -298,17 +299,16 @@ func (kv *KVServer) applier() {
 
 				kv.lock("applier")
 				ch, ok := kv.waitingChPool[applyMsg.CommandIndex]
+				kv.unlock("applier")
 
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
-						kv.unlock("applier")
 						break
 					}
 					//DPrintf("[%v] sending res to chan [%v]", kv.me, applyMsg.CommandIndex)
-					//DPrintf("[%v] success send result res to chan [%v]", kv.me, applyMsg.CommandIndex)
 					ch <- res
+					//DPrintf("[%v] success send result res to chan [%v]", kv.me, applyMsg.CommandIndex)
 				}
-				kv.unlock("applier")
 
 			} else if applyMsg.SnapshotValid {
 
@@ -429,7 +429,7 @@ func (kv *KVServer) createWaitingCh(commitIndex int) chan RequestResult {
 	kv.lock("createWaitingCh")
 	defer kv.unlock("createWaitingCh")
 
-	ch := make(chan RequestResult)
+	ch := make(chan RequestResult, 1)
 	kv.waitingChPool[commitIndex] = ch
 
 	return ch
@@ -473,4 +473,11 @@ func (kv *KVServer) deleteDoneCh(name string) {
 	}
 
 	DPrintf("[%v] channel %v has been closed", kv.me, name)
+}
+
+func getRetryTimeout() time.Duration {
+
+	ms := 500 + (rand.Int63() % 500)
+
+	return time.Duration(ms) * time.Millisecond
 }

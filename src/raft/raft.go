@@ -76,7 +76,7 @@ type Raft struct {
 
 	// 2B
 	log            []LogEntry // log
-	realNextIndex  int        // the real next index of the log
+	RealNextIndex  int        // the real next index of the log
 	logicNextIndex int        // the logic next index of the log : start from baseIndex
 	commitIndex    int        // the highest index of log has been committed
 	lastApplied    int        // the highest index of log has been replied to local state machine
@@ -121,7 +121,7 @@ func (rf *Raft) persist() {
 	encoder.Encode(rf.votedFor)
 	encoder.Encode(rf.log)
 
-	encoder.Encode(rf.realNextIndex)
+	encoder.Encode(rf.RealNextIndex)
 	// we need more information about snapshot
 	encoder.Encode(rf.lastIncludedIndex)
 	encoder.Encode(rf.lastIncludedTerm)
@@ -157,7 +157,7 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.votedFor = votedFor
 
 	rf.log = log
-	rf.realNextIndex = realNextIndex
+	rf.RealNextIndex = realNextIndex
 	rf.logicNextIndex = len(log)
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = lastIncludedTerm
@@ -181,16 +181,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	//defer rf.mu.Unlock()
 	defer rf.unlock("Snapshot")
 
-	if index >= rf.realNextIndex {
-		panic(fmt.Sprintf("[%v] the snapshot error, lastInclude is [%v], realNext is [%v]", rf.me, index, rf.realNextIndex))
-	}
-	// ignore the repeated/delay snapshot
-	if index <= rf.lastIncludedIndex {
-		return
+	if index >= rf.RealNextIndex {
+		panic(fmt.Sprintf("[%v] the snapshot error, lastInclude is [%v], realNext is [%v]", rf.me, index, rf.RealNextIndex))
 	}
 	logicIndex := rf.realToLogic(index)
-	rf.lastIncludedTerm = rf.log[logicIndex].Term
+
+	if logicIndex < 0 {
+		return
+	}
+	lastIncludedTerm := rf.log[logicIndex].Term
+
+	// ignore the repeated/delay snapshot
+	if lastIncludedTerm <= rf.lastIncludedTerm && index <= rf.lastIncludedIndex {
+		return
+	}
 	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = lastIncludedTerm
 
 	rf.log = append([]LogEntry{{rf.lastIncludedTerm, nil}}, rf.log[logicIndex+1:]...)
 	rf.logicNextIndex = len(rf.log)
@@ -230,12 +236,13 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.electionTimer.Reset(getElectionTimeout())
 
 	// refuse repeated snapshot
-	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+	if args.LastIncludedTerm <= rf.lastIncludedTerm && args.LastIncludedIndex <= rf.lastIncludedIndex {
 		//rf.unlock("InstallSnapshot")
 
 		return
 	}
-	DPrintf("[%v] apply index from [%v] to [%v]", rf.me, rf.lastApplied, rf.lastIncludedIndex)
+	// refuse snapshot that
+	DPrintf("[%v] apply index from [%v] to [%v]", rf.me, rf.lastApplied, args.LastIncludedIndex)
 
 	// discard the log entries recovered by snapshot
 	lastIncludeIndex := rf.realToLogic(args.LastIncludedIndex)
@@ -251,7 +258,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		//discardEntry = append(discardEntry, rf.log[1:]...)
 		rf.log = []LogEntry{{args.LastIncludedTerm, nil}}
 		rf.logicNextIndex = 1
-		rf.realNextIndex = args.LastIncludedIndex + 1
+		rf.RealNextIndex = args.LastIncludedIndex + 1
 	}
 	rf.snapshot = args.Snapshot
 	rf.lastIncludedIndex = args.LastIncludedIndex
@@ -282,7 +289,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	go func() {
 		rf.applyCh <- applyMsg
 	}()
-	DPrintf("[%v] apply index is [%v] - [%v]", rf.me, 1, applyMsg.SnapshotIndex)
+	DPrintf("[%v] apply snapshot index is [%v] - [%v]", rf.me, 1, applyMsg.SnapshotIndex)
 }
 
 func (rf *Raft) doInstallSnapshot(server int, args InstallSnapshotArgs) {
@@ -389,7 +396,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// vote restriction
 	lastLogTerm := rf.log[rf.logicNextIndex-1].Term
 	if lastLogTerm == args.LastLogTerm {
-		if rf.realNextIndex-1 > args.LastLogIndex {
+		if rf.RealNextIndex-1 > args.LastLogIndex {
 			reply.VoteGranted = false
 			reply.Term = rf.currentTerm
 			return
@@ -480,14 +487,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// have no entry in prevLogIndex or find conflicting log
 	preLogIndex := rf.realToLogic(args.PrevLogIndex)
 
-	DPrintf("[%v] realNextIndex is [%v]\n logicNextIndex is [%v] \n lastIncludedIndex is [%v]\n preLogIndex is [%v]", rf.me, rf.realNextIndex, rf.logicNextIndex, rf.lastIncludedIndex, preLogIndex)
-	if args.PrevLogIndex >= rf.realNextIndex || preLogIndex >= 0 && preLogIndex < rf.logicNextIndex && rf.log[preLogIndex].Term != args.PrevLogTerm {
+	DPrintf("[%v] realNextIndex is [%v]\n logicNextIndex is [%v] \n lastIncludedIndex is [%v]\n preLogIndex is [%v]", rf.me, rf.RealNextIndex, rf.logicNextIndex, rf.lastIncludedIndex, preLogIndex)
+	if args.PrevLogIndex >= rf.RealNextIndex || preLogIndex >= 0 && preLogIndex < rf.logicNextIndex && rf.log[preLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
 		DPrintf("[%v] heartbeat refuse and check", rf.me)
 		// have no entry in prevLogIndex
-		if args.PrevLogIndex >= rf.realNextIndex {
+		if args.PrevLogIndex >= rf.RealNextIndex {
 			reply.XTerm = -1
-			reply.XIndex = rf.realNextIndex
+			reply.XIndex = rf.RealNextIndex
 		} else {
 			// delete the conflicting log
 			xTerm := rf.log[preLogIndex].Term
@@ -496,7 +503,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			for xIndex > 0 && rf.log[xIndex].Term == xTerm {
 				xIndex--
 			}
-			rf.realNextIndex = rf.logicToReal(xIndex + 1)
+			rf.RealNextIndex = rf.logicToReal(xIndex + 1)
 			rf.logicNextIndex = xIndex + 1
 
 			rf.log = rf.log[:xIndex+1]
@@ -518,14 +525,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		index := args.PrevLogIndex + i + 1
 		logicIndex := rf.realToLogic(index)
 
-		if index >= rf.realNextIndex || logicIndex > 0 && rf.log[logicIndex].Term != entry.Term {
+		if index >= rf.RealNextIndex || logicIndex > 0 && rf.log[logicIndex].Term != entry.Term {
 			rf.log = rf.log[:logicIndex]
 
 			shard := args.Entries[i:]
 			// todo
 			rf.log = append(rf.log, shard...)
 			rf.logicNextIndex = logicIndex + len(shard)
-			rf.realNextIndex = index + len(shard)
+			rf.RealNextIndex = index + len(shard)
 
 			DPrintf("[%v] success append entries, cur log is [%v]", rf.me, rf.log)
 
@@ -533,20 +540,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			break
 		}
 	}
-	//DPrintf("[%v] heartbeat persist", rf.me)
 
-	//DPrintf("[%v] heartbeat check commitIndex", rf.me)
 	// check commitIndex
 
 	if args.LeaderCommit > rf.commitIndex {
 		// commit entry and reset commitIndex
-		if args.LeaderCommit < rf.realNextIndex-1 {
+		if args.LeaderCommit < rf.RealNextIndex-1 {
 			rf.commitIndex = args.LeaderCommit
 		} else {
-			rf.commitIndex = rf.realNextIndex - 1
+			rf.commitIndex = rf.RealNextIndex - 1
 		}
 		DPrintf("[%v] follower commitIndex change to %v", rf.me, rf.commitIndex)
-		DPrintf("[%v] realNextIndex is [%v], lastIncludedIndex is [%v]", rf.me, rf.realNextIndex, rf.lastIncludedIndex)
+		DPrintf("[%v] realNextIndex is [%v], lastIncludedIndex is [%v]", rf.me, rf.RealNextIndex, rf.lastIncludedIndex)
 
 		// ask the applier
 		go func() {
@@ -593,10 +598,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 	}
 	rf.log = append(rf.log, NewEntry)
-	index := rf.realNextIndex
+	index := rf.RealNextIndex
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
-	rf.realNextIndex += 1
+	rf.RealNextIndex += 1
 	rf.logicNextIndex = len(rf.log)
 
 	rf.persist()
@@ -689,7 +694,7 @@ func (rf *Raft) applier() {
 			if rf.lastApplied >= rf.commitIndex {
 				//rf.mu.Unlock()
 				rf.unlock("applier")
-				continue
+				break
 			}
 
 			lastApplied := rf.lastApplied
@@ -702,7 +707,7 @@ func (rf *Raft) applier() {
 			if logicLastApplied < 0 {
 				//rf.mu.Unlock()
 				rf.unlock("applier")
-				continue
+				break
 			}
 
 			entries := append([]LogEntry{}, rf.log[logicLastApplied+1:logicCommitIndex+1]...)
@@ -753,7 +758,7 @@ func (rf *Raft) NewElection() {
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
-		LastLogIndex: rf.realNextIndex - 1,
+		LastLogIndex: rf.RealNextIndex - 1,
 	}
 	args.LastLogTerm = rf.log[rf.logicNextIndex-1].Term
 	rf.unlock("NewElection")
@@ -844,7 +849,7 @@ func (rf *Raft) NewElection() {
 
 			// init nextIndex and matchIndex
 			for i := range rf.nextIndex {
-				rf.nextIndex[i] = rf.realNextIndex
+				rf.nextIndex[i] = rf.RealNextIndex
 				rf.matchIndex[i] = 0
 			}
 
@@ -951,12 +956,31 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 		}
 		// if heartbeat, should send RPC immediately
 		if isHeartBeat {
-			go rf.doAppendEntries(i, args)
+
+			rf.lock("doDispatchRPC")
+			lastIncludeIndex := rf.lastIncludedIndex
+			lastIncludeTerm := rf.lastIncludedTerm
+			snapshot := rf.snapshot
+			rf.unlock("doDispatchRPC")
+
+			if rf.nextIndex[i] < lastIncludeIndex {
+				// send InstallSnapshot() RPC
+				installSnapshotArgs := InstallSnapshotArgs{
+					Term:              args.Term,
+					LeaderId:          args.LeaderId,
+					LastIncludedIndex: lastIncludeIndex,
+					LastIncludedTerm:  lastIncludeTerm,
+					Snapshot:          snapshot,
+				}
+				go rf.doInstallSnapshot(i, installSnapshotArgs)
+			} else {
+				go rf.doAppendEntries(i, args)
+			}
 		}
 
 		//rf.mu.Lock()
 		rf.lock("dispatchRPC")
-		if rf.nextIndex[i] < rf.realNextIndex {
+		if rf.nextIndex[i] < rf.RealNextIndex {
 			rf.unlock("dispatchRPC")
 
 			go func(peer int) {
@@ -1043,7 +1067,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 		DPrintf("[%v] %v's matchIndex is %v", rf.me, server, rf.matchIndex[server])
 
 		// check matchIndex and update commitIndex only we remain the leader
-		for idx := rf.realNextIndex - 1; idx > rf.commitIndex; idx-- {
+		for idx := rf.RealNextIndex - 1; idx > rf.commitIndex; idx-- {
 			logicIndex := rf.realToLogic(idx)
 
 			// means that entries have been snapshot, do not need to apply
@@ -1133,7 +1157,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.log = make([]LogEntry, 1)
 	rf.log[0] = LogEntry{Term: 0}
 
-	rf.realNextIndex = 1
+	rf.RealNextIndex = 1
 	rf.logicNextIndex = 1
 
 	rf.commitIndex = 0
@@ -1275,4 +1299,11 @@ func (rf *Raft) GetCommitIndex() int {
 	defer rf.unlock("GetCommitIndex")
 
 	return rf.commitIndex
+}
+
+func (rf *Raft) GetRealNextIndex() int {
+	rf.lock("GetRealNextIndex")
+	defer rf.unlock("GetRealNextIndex")
+
+	return rf.RealNextIndex
 }

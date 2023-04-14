@@ -15,7 +15,7 @@ for i in $(seq 1 $runs); do
     echo "***" DOING THE $i TEST TRIAL
     log_name=./log/3B/test_log_$i.txt
     ## 记录日志
-    go test -run 3B > $log_name
+    go test -run TestSnapshotRecoverManyClients3B > $log_name
     ## 从日志中筛选失败消息
     fail_result=`cat $log_name | grep "FAIL"`
 

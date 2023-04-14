@@ -6,6 +6,8 @@ import (
 )
 
 const (
+	Debug = true
+
 	OK             = "OK"
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongLeader = "ErrWrongLeader"
@@ -18,14 +20,12 @@ const (
 	APPEND = "Append"
 
 	RETRY_TIMEOUT      = 500 * time.Millisecond
-	SNAPSHOT_CHECKTIME = 80 * time.Millisecond
+	Snapshot_CheckTime = 80 * time.Millisecond
 
 	CheckPointFactor = 0.75
 )
 
 type Err string
-
-const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {

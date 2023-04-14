@@ -99,8 +99,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-
-	DPrintf("[%v] server doing get [%v], commandIndex is [%v]", kv.me, args.Key, kv.rf.GetCommitIndex())
+	realNextIndex := kv.rf.RealNextIndex
+	DPrintf("[%v] server doing get [%v], commandIndex is [%v], realNextIndex is [%v]", kv.me, args.Key, commandIndex, realNextIndex)
 
 	waitingCh := kv.createWaitingCh(commandIndex)
 	defer kv.deleteWaitingCh(commandIndex)
@@ -153,7 +153,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex)
+	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v], realNextIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex, kv.rf.RealNextIndex)
 
 	waitingCh := kv.createWaitingCh(commandIndex)
 	defer kv.deleteWaitingCh(commandIndex)
@@ -202,6 +202,7 @@ func (kv *KVServer) Kill() {
 	for _, ch := range kv.doneChPool {
 		ch <- true
 	}
+	DPrintf("[%v] was killed", kv.me)
 }
 
 func (kv *KVServer) killed() bool {
@@ -248,15 +249,11 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// todo
 	snapshot := kv.rf.Persister.ReadSnapshot()
-	if len(snapshot) > 0 {
+	if snapshot != nil && len(snapshot) > 0 {
 		kv.restoreBySnapshot(snapshot)
 	}
 
 	go kv.applier()
-
-	//if maxraftstate != -1 {
-	//	go kv.snapshoter()
-	//}
 
 	return kv
 }
@@ -266,22 +263,22 @@ func (kv *KVServer) applier() {
 	doneCh := kv.createDoneCh("applier")
 	defer kv.deleteDoneCh("applier")
 
-	ticker := time.NewTicker(SNAPSHOT_CHECKTIME)
+	timer := time.NewTimer(Snapshot_CheckTime)
 
 	if kv.maxraftstate == -1 {
-		ticker.Stop()
+		timer.Stop()
 	}
 
-	for !kv.killed() {
+	for {
 		select {
 		case applyMsg := <-kv.applyCh:
 
 			if applyMsg.CommandValid && applyMsg.Command != nil {
-				DPrintf("[%v] applyIndex is [%v]", kv.me, applyMsg.CommandIndex)
+				DPrintf("[%v] applyIndex is [%v], realNextIndex is [%v]", kv.me, applyMsg.CommandIndex, kv.rf.RealNextIndex)
 
 				// throw the Command that included in the snapshot
 				if applyMsg.CommandIndex <= kv.LastIncludedIndex {
-					continue
+					break
 				}
 
 				opr, _ := applyMsg.Command.(Op)
@@ -290,9 +287,7 @@ func (kv *KVServer) applier() {
 
 				DPrintf("[%v] success handler command [%v]", kv.me, applyMsg.CommandIndex)
 
-				if applyMsg.CommandIndex > kv.LastIncludedIndex {
-					kv.LastIncludedIndex = applyMsg.CommandIndex
-				}
+				kv.LastIncludedIndex = applyMsg.CommandIndex
 
 				kv.lock("applier")
 				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
@@ -311,18 +306,23 @@ func (kv *KVServer) applier() {
 
 				DPrintf("[%v] snapshot index is [%v]", kv.me, applyMsg.SnapshotIndex)
 				kv.restoreBySnapshot(applyMsg.Snapshot)
-				//kv.LastIncludedIndex = applyMsg.SnapshotIndex
 			}
 
-		case <-ticker.C:
+		case <-timer.C:
 			// check whether we should snapshot( >= 0.75 * maxsize
 			if float64(kv.rf.Persister.RaftStateSize()) >= CheckPointFactor*float64(kv.maxraftstate) {
 				kv.snapshot()
 			}
+			timer.Reset(Snapshot_CheckTime)
 
 		case <-doneCh:
 
 			DPrintf("[%v] server applier is dead", kv.me)
+
+			if !timer.Stop() {
+				<-timer.C
+			}
+
 			return
 		}
 	}
@@ -359,35 +359,10 @@ func (kv *KVServer) apply(opr Op) RequestResult {
 	return result
 }
 
-// the goroutine that listen to the snapshot checkpoint
-//func (kv *KVServer) snapshoter() {
-//	doneCh := kv.createDoneCh("snapshoter")
-//	defer kv.deleteDoneCh("snapshoter")
-//
-//	ticker := time.NewTicker(SNAPSHOT_CHECKTIME)
-//
-//	for {
-//		select {
-//		case <-ticker.C:
-//
-//			// check whether we should snapshot
-//			if kv.rf.Persister.RaftStateSize() >= kv.maxraftstate {
-//				kv.snapshot()
-//			}
-//
-//		case <-doneCh:
-//
-//			ticker.Stop()
-//
-//			return
-//		}
-//	}
-//}
-
 // real logic of snapshot, encode state to []byte
 func (kv *KVServer) snapshot() {
 
-	DPrintf("[%v] server is snapshotting", kv.me)
+	DPrintf("[%v] server is snapshotting, lastInclude is [%v], realNext is [%v]", kv.me, kv.LastIncludedIndex, kv.rf.RealNextIndex)
 	buf := new(bytes.Buffer)
 	encoder := gob.NewEncoder(buf)
 
@@ -414,6 +389,9 @@ func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
 
 		panic(fmt.Sprintf("[%v] restore by snapshot error", kv.me))
 	}
+
+	DPrintf("[%v] recovering from snapshot [%v]", kv.me, lastIncludedIndex)
+
 	kv.DB = &db
 	kv.DuplicateMap = duplicateMap
 	kv.LastIncludedIndex = lastIncludedIndex
@@ -458,6 +436,8 @@ func (kv *KVServer) createDoneCh(name string) <-chan interface{} {
 	//rf.mu.Lock()
 	kv.lock("createDoneCh")
 	defer kv.unlock("createDoneCh")
+
+	DPrintf("[%v] channel %v has been created", kv.me, name)
 
 	doneCh := make(chan interface{}, 1)
 	kv.doneChPool[name] = doneCh

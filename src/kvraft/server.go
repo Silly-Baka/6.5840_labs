@@ -33,10 +33,10 @@ type KVServer struct {
 
 	// Your definitions here.
 	// 3A
-	DB           *DataBase
-	doneChPool   map[string]chan interface{}
-	DuplicateMap map[int64]int              // map that record each client's last Seq
-	waitingChMap map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
+	DB            *DataBase
+	doneChPool    map[string]chan interface{}
+	DuplicateMap  map[int64]int              // map that record each client's last Seq
+	waitingChPool map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
 	// 3B
 	LastIncludedIndex int
 	threshold         float64 // the threshold of RaftStateSize, snapshot when >= threshold
@@ -99,8 +99,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		reply.Err = ErrWrongLeader
 		return
 	}
-	realNextIndex := kv.rf.RealNextIndex
-	DPrintf("[%v] server doing get [%v], commandIndex is [%v], realNextIndex is [%v]", kv.me, args.Key, commandIndex, realNextIndex)
+	//realNextIndex := kv.rf.GetRealNextIndex()
+	//DPrintf("[%v] server doing get [%v], commandIndex is [%v], realNextIndex is [%v]", kv.me, args.Key, commandIndex, realNextIndex)
 
 	waitingCh := kv.createWaitingCh(commandIndex)
 	defer kv.deleteWaitingCh(commandIndex)
@@ -153,7 +153,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		return
 	}
 
-	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v], realNextIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex, kv.rf.RealNextIndex)
+	//DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v], realNextIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex, kv.rf.GetRealNextIndex())
 
 	waitingCh := kv.createWaitingCh(commandIndex)
 	defer kv.deleteWaitingCh(commandIndex)
@@ -239,7 +239,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.doneChPool = make(map[string]chan interface{})
 	kv.DuplicateMap = make(map[int64]int)
-	kv.waitingChMap = make(map[int]chan RequestResult)
+	kv.waitingChPool = make(map[int]chan RequestResult)
 
 	db := new(DataBase)
 	db.Data = make(map[string]string)
@@ -276,7 +276,8 @@ func (kv *KVServer) applier() {
 		case applyMsg := <-kv.applyCh:
 
 			if applyMsg.CommandValid && applyMsg.Command != nil {
-				DPrintf("[%v] applyIndex is [%v], realNextIndex is [%v]", kv.me, applyMsg.CommandIndex, kv.rf.RealNextIndex)
+
+				//DPrintf("[%v] applyIndex is [%v], realNextIndex is [%v]", kv.me, applyMsg.CommandIndex, kv.rf.GetRealNextIndex())
 
 				// throw the Command that included in the snapshot
 				if applyMsg.CommandIndex <= kv.LastIncludedIndex {
@@ -292,15 +293,16 @@ func (kv *KVServer) applier() {
 				kv.LastIncludedIndex = applyMsg.CommandIndex
 
 				kv.lock("applier")
-				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
+				ch, ok := kv.waitingChPool[applyMsg.CommandIndex]
+
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
 						kv.unlock("applier")
 						break
 					}
-					DPrintf("[%v] sending res to chan [%v]", kv.me, applyMsg.CommandIndex)
+					//DPrintf("[%v] sending res to chan [%v]", kv.me, applyMsg.CommandIndex)
+					//DPrintf("[%v] success send result res to chan [%v]", kv.me, applyMsg.CommandIndex)
 					ch <- res
-					DPrintf("[%v] success send result res to chan [%v]", kv.me, applyMsg.CommandIndex)
 				}
 				kv.unlock("applier")
 
@@ -311,6 +313,7 @@ func (kv *KVServer) applier() {
 			}
 
 		case <-timer.C:
+			timer.Stop()
 			// check whether we should snapshot( >= 0.6 * maxsize
 			if float64(kv.rf.Persister.RaftStateSize()) >= kv.threshold {
 				kv.snapshot()
@@ -321,9 +324,11 @@ func (kv *KVServer) applier() {
 
 			DPrintf("[%v] server applier is dead", kv.me)
 
-			if !timer.Stop() {
-				<-timer.C
-			}
+			go func() {
+				if !timer.Stop() {
+					<-timer.C
+				}
+			}()
 
 			return
 		}
@@ -375,6 +380,8 @@ func (kv *KVServer) snapshot() {
 	}
 
 	kv.rf.Snapshot(kv.LastIncludedIndex, buf.Bytes())
+
+	DPrintf("[%v] snapshot successfully", kv.me)
 }
 
 func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
@@ -397,6 +404,8 @@ func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
 	kv.DB = &db
 	kv.DuplicateMap = duplicateMap
 	kv.LastIncludedIndex = lastIncludedIndex
+
+	DPrintf("[%v] success recover from snapshot", kv.me)
 }
 
 func (kv *KVServer) lock(name string) {
@@ -417,7 +426,7 @@ func (kv *KVServer) createWaitingCh(commitIndex int) chan RequestResult {
 	defer kv.unlock("createWaitingCh")
 
 	ch := make(chan RequestResult)
-	kv.waitingChMap[commitIndex] = ch
+	kv.waitingChPool[commitIndex] = ch
 
 	return ch
 }
@@ -426,10 +435,10 @@ func (kv *KVServer) deleteWaitingCh(commitIndex int) {
 	kv.lock("deleteWaitingCh")
 	defer kv.unlock("deleteWaitingCh")
 
-	ch := kv.waitingChMap[commitIndex]
+	ch := kv.waitingChPool[commitIndex]
 
 	if ch != nil {
-		delete(kv.waitingChMap, commitIndex)
+		delete(kv.waitingChPool, commitIndex)
 		close(ch)
 	}
 }

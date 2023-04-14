@@ -602,7 +602,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
 	rf.RealNextIndex += 1
-	rf.logicNextIndex = len(rf.log)
+	rf.logicNextIndex += 1
 
 	rf.persist()
 
@@ -954,15 +954,17 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 		if i == rf.me {
 			continue
 		}
+
+		rf.lock("doDispatchRPC")
+		nextIndex := rf.nextIndex[i]
+		lastIncludeIndex := rf.lastIncludedIndex
+		lastIncludeTerm := rf.lastIncludedTerm
+		snapshot := rf.snapshot
+		realNextIndex := rf.RealNextIndex
+		rf.unlock("doDispatchRPC")
+
 		// if heartbeat, should send RPC immediately
 		if isHeartBeat {
-
-			rf.lock("doDispatchRPC")
-			nextIndex := rf.nextIndex[i]
-			lastIncludeIndex := rf.lastIncludedIndex
-			lastIncludeTerm := rf.lastIncludedTerm
-			snapshot := rf.snapshot
-			rf.unlock("doDispatchRPC")
 
 			if nextIndex <= lastIncludeIndex {
 				// send InstallSnapshot() RPC
@@ -978,19 +980,12 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 			} else {
 				go rf.doAppendEntries(i, args)
 			}
+		}
 
-		} else {
-
-			rf.lock("dispatchRPC")
-			nextIndex := rf.nextIndex[i]
-			realNextIndex := rf.RealNextIndex
-			rf.unlock("dispatchRPC")
-
-			if nextIndex < realNextIndex {
-				go func(peer int) {
-					rf.replicatorChPool[peer] <- args
-				}(i)
-			}
+		if nextIndex < realNextIndex {
+			go func(peer int) {
+				rf.replicatorChPool[peer] <- args
+			}(i)
 		}
 	}
 }
@@ -1007,6 +1002,11 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 	}
 
 	preLogIndex := rf.realToLogic(rf.nextIndex[server] - 1)
+
+	// do not send entries before snapshot
+	if preLogIndex < 0 {
+		return
+	}
 
 	if preLogIndex >= 0 {
 		args.PrevLogTerm = rf.log[preLogIndex].Term
@@ -1204,16 +1204,16 @@ func (rf *Raft) InitReplicator() {
 				// do heartbeat or AppendEntries()
 				case args := <-rf.replicatorChPool[server]:
 
-					//innerDoneCh := make(chan bool)
-					//go func() {
-					//	for {
-					//		select {
-					//		case <-rf.replicatorChPool[server]:
-					//		case <-innerDoneCh:
-					//			return
-					//		}
-					//	}
-					//}()
+					innerDoneCh := make(chan bool)
+					go func() {
+						for {
+							select {
+							case <-rf.replicatorChPool[server]:
+							case <-innerDoneCh:
+								return
+							}
+						}
+					}()
 
 					DPrintf("[%v] doing appendEntries to [%v]", rf.me, server)
 
@@ -1245,7 +1245,7 @@ func (rf *Raft) InitReplicator() {
 
 						rf.doInstallSnapshot(server, installSnapshotArgs)
 					}
-					//innerDoneCh <- true
+					innerDoneCh <- true
 
 				// close the goroutine
 				case <-doneCh:

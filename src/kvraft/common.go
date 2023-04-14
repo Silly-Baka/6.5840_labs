@@ -19,6 +19,8 @@ const (
 
 	RETRY_TIMEOUT      = 500 * time.Millisecond
 	SNAPSHOT_CHECKTIME = 80 * time.Millisecond
+
+	CheckPointFactor = 0.75
 )
 
 type Err string

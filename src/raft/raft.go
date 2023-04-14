@@ -256,8 +256,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.snapshot = args.Snapshot
 	rf.lastIncludedIndex = args.LastIncludedIndex
 	rf.lastIncludedTerm = args.LastIncludedTerm
-	rf.lastApplied = args.LastIncludedIndex
-	rf.commitIndex = args.LastIncludedIndex
+
+	// todo
+	if rf.lastIncludedIndex >= rf.commitIndex {
+		rf.commitIndex = args.LastIncludedIndex
+		rf.lastApplied = args.LastIncludedIndex
+	}
 
 	rf.persist()
 
@@ -283,14 +287,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 func (rf *Raft) doInstallSnapshot(server int, args InstallSnapshotArgs) {
 
-	//rf.mu.Lock()
 	rf.lock("doInstallSnapshot")
 	if rf.killed() || rf.state != Leader {
 		//rf.mu.Unlock()
 		rf.unlock("doInstallSnapshot")
 		return
 	}
-	//rf.mu.Unlock()
 	rf.unlock("doInstallSnapshot")
 
 	DPrintf("[%v] sending snapshot to [%v]", rf.me, server)
@@ -520,7 +522,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = rf.log[:logicIndex]
 
 			shard := args.Entries[i:]
-			rf.log = append(rf.log, append([]LogEntry{}, shard...)...)
+			// todo
+			rf.log = append(rf.log, shard...)
 			rf.logicNextIndex = logicIndex + len(shard)
 			rf.realNextIndex = index + len(shard)
 
@@ -594,7 +597,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 	isLeader := rf.state == Leader
 	rf.realNextIndex += 1
-	rf.logicNextIndex += 1
+	rf.logicNextIndex = len(rf.log)
 
 	rf.persist()
 
@@ -715,7 +718,6 @@ func (rf *Raft) applier() {
 					CommandIndex: lastApplied + i + 1,
 					CommandTerm:  currentTerm,
 				}
-				//rf.applierCh <- applyMsg
 				rf.applyCh <- applyMsg
 				DPrintf("[%v] apply index is [%v]", rf.me, applyMsg.CommandIndex)
 			}
@@ -1050,7 +1052,10 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 			}
 			if rf.log[logicIndex].Term == rf.currentTerm {
 				count := 1
-				for _, v := range rf.matchIndex {
+				for i, v := range rf.matchIndex {
+					if i == rf.me {
+						continue
+					}
 					if v >= idx {
 						count++
 					}

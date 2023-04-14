@@ -94,16 +94,16 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	// check if the command is logged successfully
-	commitIndex, term, _ := kv.rf.Start(opr)
+	commandIndex, term, _ := kv.rf.Start(opr)
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	DPrintf("[%v] server doing get [%v], commitIndex is [%v]", kv.me, args.Key, kv.rf.GetCommitIndex())
+	DPrintf("[%v] server doing get [%v], commandIndex is [%v]", kv.me, args.Key, kv.rf.GetCommitIndex())
 
-	waitingCh := kv.createWaitingCh(commitIndex)
-	//defer kv.deleteWaitingCh(commitIndex)
+	waitingCh := kv.createWaitingCh(commandIndex)
+	defer kv.deleteWaitingCh(commandIndex)
 
 	timer := time.NewTimer(RETRY_TIMEOUT)
 
@@ -126,6 +126,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case <-timer.C:
 		// timeout and retry
 		reply.Err = ErrTimeOut
+
 		return
 	}
 }
@@ -145,17 +146,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 	}
-	commitIndex, term, _ := kv.rf.Start(opr)
+	commandIndex, term, _ := kv.rf.Start(opr)
 
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
 		return
 	}
 
-	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commitIndex)
+	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex)
 
-	waitingCh := kv.createWaitingCh(commitIndex)
-	//defer kv.deleteWaitingCh(commitIndex)
+	waitingCh := kv.createWaitingCh(commandIndex)
+	defer kv.deleteWaitingCh(commandIndex)
 
 	timer := time.NewTimer(RETRY_TIMEOUT)
 
@@ -177,6 +178,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-timer.C:
 		// timeout and retry
 		reply.Err = ErrTimeOut
+
 		return
 	}
 }
@@ -274,9 +276,14 @@ func (kv *KVServer) applier() {
 		select {
 		case applyMsg := <-kv.applyCh:
 
-			DPrintf("[%v] server get applyIndex is [%v]", kv.me, applyMsg.CommandIndex)
+			if applyMsg.CommandValid && applyMsg.Command != nil {
+				DPrintf("[%v] applyIndex is [%v]", kv.me, applyMsg.CommandIndex)
 
-			if applyMsg.CommandValid {
+				// throw the Command that included in the snapshot
+				if applyMsg.CommandIndex <= kv.LastIncludedIndex {
+					continue
+				}
+
 				opr, _ := applyMsg.Command.(Op)
 
 				res := kv.apply(opr)
@@ -289,28 +296,27 @@ func (kv *KVServer) applier() {
 
 				kv.lock("applier")
 				ch, ok := kv.waitingChMap[applyMsg.CommandIndex]
-				kv.unlock("applier")
-
 				if ok {
 					if term, isLeader := kv.rf.GetState(); !isLeader || term != applyMsg.CommandTerm {
+						kv.unlock("applier")
 						break
 					}
-					DPrintf("[%v] send res to chan", kv.me)
+					DPrintf("[%v] sending res to chan [%v]", kv.me, applyMsg.CommandIndex)
 					ch <- res
-
-					kv.deleteWaitingCh(applyMsg.CommandIndex)
+					DPrintf("[%v] success send result res to chan [%v]", kv.me, applyMsg.CommandIndex)
 				}
+				kv.unlock("applier")
 
-			} else if applyMsg.SnapshotValid && applyMsg.SnapshotIndex > kv.LastIncludedIndex {
+			} else if applyMsg.SnapshotValid {
 
-				DPrintf("[%v] get snapshot [%v]", kv.me, applyMsg.SnapshotIndex)
+				DPrintf("[%v] snapshot index is [%v]", kv.me, applyMsg.SnapshotIndex)
 				kv.restoreBySnapshot(applyMsg.Snapshot)
-				kv.LastIncludedIndex = applyMsg.SnapshotIndex
+				//kv.LastIncludedIndex = applyMsg.SnapshotIndex
 			}
 
 		case <-ticker.C:
-			// check whether we should snapshot
-			if kv.rf.Persister.RaftStateSize() >= kv.maxraftstate {
+			// check whether we should snapshot( >= 0.75 * maxsize
+			if float64(kv.rf.Persister.RaftStateSize()) >= CheckPointFactor*float64(kv.maxraftstate) {
 				kv.snapshot()
 			}
 
@@ -385,7 +391,9 @@ func (kv *KVServer) snapshot() {
 	buf := new(bytes.Buffer)
 	encoder := gob.NewEncoder(buf)
 
-	if encoder.Encode(&kv.DB) != nil || encoder.Encode(&kv.DuplicateMap) != nil {
+	if encoder.Encode(&kv.DB) != nil ||
+		encoder.Encode(&kv.DuplicateMap) != nil ||
+		encoder.Encode(&kv.LastIncludedIndex) != nil {
 		panic(fmt.Sprintf("[%v] snapshot error", kv.me))
 	}
 
@@ -396,11 +404,19 @@ func (kv *KVServer) restoreBySnapshot(snapshot []byte) {
 
 	decoder := gob.NewDecoder(bytes.NewBuffer(snapshot))
 
-	if decoder.Decode(&kv.DB) != nil ||
-		decoder.Decode(&kv.DuplicateMap) != nil {
+	var db DataBase
+	var duplicateMap map[int64]int
+	var lastIncludedIndex int
+
+	if decoder.Decode(&db) != nil ||
+		decoder.Decode(&duplicateMap) != nil ||
+		decoder.Decode(&lastIncludedIndex) != nil {
 
 		panic(fmt.Sprintf("[%v] restore by snapshot error", kv.me))
 	}
+	kv.DB = &db
+	kv.DuplicateMap = duplicateMap
+	kv.LastIncludedIndex = lastIncludedIndex
 }
 
 func (kv *KVServer) lock(name string) {

@@ -126,6 +126,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	case <-timer.C:
 		// timeout and retry
 		reply.Err = ErrTimeOut
+		timer.Stop()
 
 		return
 	}
@@ -178,6 +179,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	case <-timer.C:
 		// timeout and retry
 		reply.Err = ErrTimeOut
+		timer.Stop()
 
 		return
 	}
@@ -192,6 +194,8 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 // about this, but it may be convenient (for example)
 // to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
+	DPrintf("[%v] killing", kv.me)
+
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 

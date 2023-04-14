@@ -189,6 +189,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	if logicIndex < 0 {
 		return
 	}
+
 	lastIncludedTerm := rf.log[logicIndex].Term
 
 	// ignore the repeated/delay snapshot
@@ -646,7 +647,7 @@ func (rf *Raft) ticker() {
 	defer rf.deleteDoneCh("ticker")
 
 	//testTimer := time.NewTimer(300 * time.Millisecond)
-	for !rf.killed() {
+	for {
 		// Your code here (2A)
 		//Check if a leader election should be started.
 		startTime := time.Now()
@@ -966,7 +967,7 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 		// if heartbeat, should send RPC immediately
 		if isHeartBeat {
 
-			if nextIndex <= lastIncludeIndex {
+			if nextIndex < lastIncludeIndex {
 				// send InstallSnapshot() RPC
 				installSnapshotArgs := InstallSnapshotArgs{
 					Term:              args.Term,
@@ -1005,6 +1006,7 @@ func (rf *Raft) doAppendEntries(server int, args AppendEntriesArgs) {
 
 	// do not send entries before snapshot
 	if preLogIndex < 0 {
+		rf.unlock("doAppendEntries")
 		return
 	}
 

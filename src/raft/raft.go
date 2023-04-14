@@ -958,12 +958,13 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 		if isHeartBeat {
 
 			rf.lock("doDispatchRPC")
+			nextIndex := rf.nextIndex[i]
 			lastIncludeIndex := rf.lastIncludedIndex
 			lastIncludeTerm := rf.lastIncludedTerm
 			snapshot := rf.snapshot
 			rf.unlock("doDispatchRPC")
 
-			if rf.nextIndex[i] < lastIncludeIndex {
+			if nextIndex <= lastIncludeIndex {
 				// send InstallSnapshot() RPC
 				installSnapshotArgs := InstallSnapshotArgs{
 					Term:              args.Term,
@@ -973,21 +974,23 @@ func (rf *Raft) doDispatchRPC(isHeartBeat bool) {
 					Snapshot:          snapshot,
 				}
 				go rf.doInstallSnapshot(i, installSnapshotArgs)
+
 			} else {
 				go rf.doAppendEntries(i, args)
 			}
-		}
 
-		//rf.mu.Lock()
-		rf.lock("dispatchRPC")
-		if rf.nextIndex[i] < rf.RealNextIndex {
-			rf.unlock("dispatchRPC")
-
-			go func(peer int) {
-				rf.replicatorChPool[peer] <- args
-			}(i)
 		} else {
+
+			rf.lock("dispatchRPC")
+			nextIndex := rf.nextIndex[i]
+			realNextIndex := rf.RealNextIndex
 			rf.unlock("dispatchRPC")
+
+			if nextIndex < realNextIndex {
+				go func(peer int) {
+					rf.replicatorChPool[peer] <- args
+				}(i)
+			}
 		}
 	}
 }
@@ -1201,26 +1204,31 @@ func (rf *Raft) InitReplicator() {
 				// do heartbeat or AppendEntries()
 				case args := <-rf.replicatorChPool[server]:
 
-					innerDoneCh := make(chan bool)
-					go func() {
-						for {
-							select {
-							case <-rf.replicatorChPool[server]:
-							case <-innerDoneCh:
-								return
-							}
-						}
-					}()
+					//innerDoneCh := make(chan bool)
+					//go func() {
+					//	for {
+					//		select {
+					//		case <-rf.replicatorChPool[server]:
+					//		case <-innerDoneCh:
+					//			return
+					//		}
+					//	}
+					//}()
 
 					DPrintf("[%v] doing appendEntries to [%v]", rf.me, server)
 
 					//rf.mu.Lock()
 					rf.lock("InitReplicator")
 
+					nextIndex := rf.nextIndex[server]
+					lastIncludedIndex := rf.lastIncludedIndex
+					lastIncludedTerm := rf.lastIncludedTerm
+					snapshot := rf.snapshot
+
+					rf.unlock("InitReplicator")
+
 					// distinguish whether the log has been compacted
-					if rf.nextIndex[server] > rf.lastIncludedIndex {
-						//rf.mu.Unlock()
-						rf.unlock("InitReplicator")
+					if nextIndex > lastIncludedIndex {
 
 						//DPrintf("[%v] follower [%v] delay in [%v], send AppendEntries", rf.me, server, rf.nextIndex[server])
 						rf.doAppendEntries(server, args)
@@ -1230,16 +1238,15 @@ func (rf *Raft) InitReplicator() {
 						installSnapshotArgs := InstallSnapshotArgs{
 							Term:              args.Term,
 							LeaderId:          args.LeaderId,
-							LastIncludedIndex: rf.lastIncludedIndex,
-							LastIncludedTerm:  rf.lastIncludedTerm,
-							Snapshot:          rf.snapshot,
+							LastIncludedIndex: lastIncludedIndex,
+							LastIncludedTerm:  lastIncludedTerm,
+							Snapshot:          snapshot,
 						}
-						//rf.mu.Unlock()
-						rf.unlock("InitReplicator")
 
 						rf.doInstallSnapshot(server, installSnapshotArgs)
 					}
-					innerDoneCh <- true
+					//innerDoneCh <- true
+
 				// close the goroutine
 				case <-doneCh:
 					return

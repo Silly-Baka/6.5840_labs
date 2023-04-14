@@ -9,6 +9,7 @@ runs=$1
 
 rm -rf ./log/3A/test_log_*
 
+pass_count=0
 fail_count=0
 for i in $(seq 1 $runs); do
     echo "***" DOING THE $i TEST TRIAL
@@ -21,15 +22,15 @@ for i in $(seq 1 $runs); do
     ## 输出最后两行的时间记录
     tail -2 $log_name
 
-    ## 输出测试结果
     if [[ $fail_result =~ "FAIL" ]]
     then
-        echo '*******' FAILED TESTS IN TRIAL $i '*******'
         fail_count=`expr $fail_count + 1`
+        echo FAILED in $i , pass $pass_count,fail $fail_count
     else
       ## 删掉正常执行的日志
         rm -f $log_name
-        echo "***" PASSED THE $i TESTING TRIAL
+        pass_count=`expr $pass_count + 1`
+        echo PASSED in $i , pass $pass_count,fail $fail_count
     fi
 done
 if [[ $fail_count -eq 0 ]]
@@ -38,5 +39,3 @@ then
 else
   echo '***' FAILED SOME TESTING TRIALS : $fail_count
 fi
-
-echo `tail -2 ./`

@@ -37,9 +37,9 @@ type KVServer struct {
 	doneChPool   map[string]chan interface{}
 	DuplicateMap map[int64]int              // map that record each client's last Seq
 	waitingChMap map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
-
-	//
+	// 3B
 	LastIncludedIndex int
+	threshold         float64 // the threshold of RaftStateSize, snapshot when >= threshold
 }
 
 type DataBase struct {
@@ -245,7 +245,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	db.Data = make(map[string]string)
 	kv.DB = db
 
+	// 3B
 	kv.LastIncludedIndex = 0
+	kv.threshold = CheckPointFactor * float64(kv.maxraftstate)
 
 	// todo
 	snapshot := kv.rf.Persister.ReadSnapshot()
@@ -309,8 +311,8 @@ func (kv *KVServer) applier() {
 			}
 
 		case <-timer.C:
-			// check whether we should snapshot( >= 0.75 * maxsize
-			if float64(kv.rf.Persister.RaftStateSize()) >= CheckPointFactor*float64(kv.maxraftstate) {
+			// check whether we should snapshot( >= 0.6 * maxsize
+			if float64(kv.rf.Persister.RaftStateSize()) >= kv.threshold {
 				kv.snapshot()
 			}
 			timer.Reset(Snapshot_CheckTime)

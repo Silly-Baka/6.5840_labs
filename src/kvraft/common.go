@@ -20,9 +20,8 @@ const (
 	APPEND = "Append"
 
 	RETRY_TIMEOUT      = 500 * time.Millisecond
-	Snapshot_CheckTime = 80 * time.Millisecond
-
-	CheckPointFactor = 0.75
+	Snapshot_CheckTime = 50 * time.Millisecond
+	CheckPointFactor   = 0.6
 )
 
 type Err string

@@ -104,13 +104,15 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	//DPrintf("[%v] server doing get [%v], commandIndex is [%v], realNextIndex is [%v]", kv.me, args.Key, commandIndex, realNextIndex)
 
 	waitingCh := kv.createWaitingCh(commandIndex)
-	defer kv.deleteWaitingCh(commandIndex)
 
 	timer := time.NewTimer(getRetryTimeout())
 
 	select {
 
 	case res := <-waitingCh:
+
+		// close the channel
+		kv.deleteWaitingCh(commandIndex)
 
 		DPrintf("[%v] rpc applier get the result", kv.me)
 		_, isLeader := kv.rf.GetState()
@@ -128,6 +130,13 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		// timeout and retry
 		reply.Err = ErrTimeOut
 		timer.Stop()
+
+		// the goroutine that waiting for result
+		go func() {
+			defer kv.deleteWaitingCh(commandIndex)
+
+			<-waitingCh
+		}()
 
 		return
 	}
@@ -158,13 +167,14 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("[%v] server doing %v [%v : %v], seq is [%v], CommandIndex is [%v]", kv.me, args.Op, args.Key, args.Value, args.Seq, commandIndex)
 
 	waitingCh := kv.createWaitingCh(commandIndex)
-	defer kv.deleteWaitingCh(commandIndex)
 
 	timer := time.NewTimer(getRetryTimeout())
 
 	select {
 
 	case res := <-waitingCh:
+
+		kv.deleteWaitingCh(commandIndex)
 
 		DPrintf("[%v] rpc applier get the result", kv.me)
 		_, isLeader := kv.rf.GetState()
@@ -181,6 +191,12 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		// timeout and retry
 		reply.Err = ErrTimeOut
 		timer.Stop()
+
+		go func() {
+			defer kv.deleteWaitingCh(commandIndex)
+
+			<-waitingCh
+		}()
 
 		return
 	}
@@ -429,7 +445,7 @@ func (kv *KVServer) createWaitingCh(commitIndex int) chan RequestResult {
 	kv.lock("createWaitingCh")
 	defer kv.unlock("createWaitingCh")
 
-	ch := make(chan RequestResult, 1)
+	ch := make(chan RequestResult)
 	kv.waitingChPool[commitIndex] = ch
 
 	return ch
@@ -477,7 +493,7 @@ func (kv *KVServer) deleteDoneCh(name string) {
 
 func getRetryTimeout() time.Duration {
 
-	ms := 500 + (rand.Int63() % 500)
+	ms := 500 + (rand.Int63() % 300)
 
 	return time.Duration(ms) * time.Millisecond
 }

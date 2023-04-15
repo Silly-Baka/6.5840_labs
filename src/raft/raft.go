@@ -193,7 +193,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	lastIncludedTerm := rf.log[logicIndex].Term
 
 	// ignore the repeated/delay snapshot
-	if lastIncludedTerm <= rf.lastIncludedTerm && index <= rf.lastIncludedIndex {
+	if index <= rf.lastIncludedIndex {
 		return
 	}
 	rf.lastIncludedIndex = index
@@ -237,7 +237,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.electionTimer.Reset(getElectionTimeout())
 
 	// refuse repeated snapshot
-	if args.LastIncludedTerm <= rf.lastIncludedTerm && args.LastIncludedIndex <= rf.lastIncludedIndex {
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
 		//rf.unlock("InstallSnapshot")
 
 		return

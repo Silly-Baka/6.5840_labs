@@ -300,10 +300,10 @@ func (kv *KVServer) applier() {
 
 				//DPrintf("[%v] applyIndex is [%v], realNextIndex is [%v]", kv.me, applyMsg.CommandIndex, kv.rf.GetRealNextIndex())
 
-				// throw the Command that included in the snapshot
-				if applyMsg.CommandIndex <= kv.LastIncludedIndex {
-					break
-				}
+				//// throw the Command that included in the snapshot
+				//if applyMsg.CommandIndex <= kv.LastIncludedIndex {
+				//	break
+				//}
 
 				opr, _ := applyMsg.Command.(Op)
 
@@ -311,7 +311,9 @@ func (kv *KVServer) applier() {
 
 				DPrintf("[%v] success handler command [%v]", kv.me, applyMsg.CommandIndex)
 
-				kv.LastIncludedIndex = applyMsg.CommandIndex
+				if applyMsg.CommandIndex > kv.LastIncludedIndex {
+					kv.LastIncludedIndex = applyMsg.CommandIndex
+				}
 
 				kv.lock("applier")
 				ch, ok := kv.waitingChPool[applyMsg.CommandIndex]
@@ -493,7 +495,7 @@ func (kv *KVServer) deleteDoneCh(name string) {
 
 func getRetryTimeout() time.Duration {
 
-	ms := 500 + (rand.Int63() % 300)
+	ms := 500 + (rand.Int63() % 400)
 
 	return time.Duration(ms) * time.Millisecond
 }

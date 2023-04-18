@@ -11,7 +11,8 @@ rm -rf ./log/3B/test_log_*
 
 pass_count=0
 fail_count=0
-for i in $(seq 1 $runs); do
+for i in $(seq 1 $runs);
+do
     echo "***" DOING THE $i TEST TRIAL
     log_name=./log/3B/test_log_$i.txt
     ## 记录日志

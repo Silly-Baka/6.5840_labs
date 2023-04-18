@@ -45,7 +45,7 @@ const (
 	ErrTimeOut     = "timeout"
 	Ok             = "ok"
 
-	VirtualNodeNum = 8
+	VirtualNodeNum = 100
 )
 
 type Err string

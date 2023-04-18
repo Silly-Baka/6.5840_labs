@@ -88,6 +88,8 @@ func (ck *Clerk) requestHandler() {
 				}
 				ck.doMove(&args)
 
+				future.responseCh <- struct{}{}
+
 			case Query:
 
 				num, _ := future.args[0].(int)
@@ -127,7 +129,7 @@ func (ck *Clerk) Query(num int) Config {
 	}
 }
 
-func (ck *Clerk) doQuery(args *QueryArgs) *Config {
+func (ck *Clerk) doQuery(args *QueryArgs) Config {
 	// try each known server.
 
 	i := ck.lastLeader
@@ -145,7 +147,7 @@ func (ck *Clerk) doQuery(args *QueryArgs) *Config {
 
 				DPrintf("client success Query [%v]", args.Num)
 
-				return &reply.Config
+				return reply.Config
 			}
 		}
 		// retry, maybe timeout or wrong leader

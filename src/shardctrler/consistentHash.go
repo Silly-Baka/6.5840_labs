@@ -15,9 +15,10 @@ type HashRing struct {
 
 func NewHashRing(virtualNodeNum int) *HashRing {
 	return &HashRing{
-		Ring:           make([]int, 0),
-		RealNodesMap:   make(map[int]int),
-		VirtualNodeNum: virtualNodeNum,
+		Ring:            make([]int, 0),
+		RealNodesMap:    make(map[int]int),
+		VirtualNodesMap: make(map[int][]int),
+		VirtualNodeNum:  virtualNodeNum,
 	}
 }
 
@@ -65,7 +66,7 @@ func (hr *HashRing) removeNode(node int) {
 
 		preArr := append([]int{}, hr.Ring[:idx]...)
 
-		hr.Ring = append(preArr, hr.Ring[idx:]...)
+		hr.Ring = append(preArr, hr.Ring[idx+1:]...)
 	}
 	delete(hr.VirtualNodesMap, node)
 }
@@ -73,6 +74,9 @@ func (hr *HashRing) removeNode(node int) {
 // get the node that responsible for the shard
 func (hr *HashRing) getNode(shard int) int {
 
+	if len(hr.Ring) == 0 {
+		return 0
+	}
 	hash := int(crc32.ChecksumIEEE([]byte(strconv.Itoa(shard))))
 
 	// check the Ring，find the node that bigger than hash

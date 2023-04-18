@@ -34,7 +34,7 @@ type Op struct {
 }
 
 type RequestResult struct {
-	config Config
+	config *Config
 	err    Err
 }
 
@@ -61,6 +61,8 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 		reply.WrongLeader = true
 		return
 	}
+
+	DPrintf("[%v] doing join [%v]", sc.me, args.Servers)
 
 	waitingCh := sc.createWaitingCh(commandIndex)
 
@@ -125,6 +127,8 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 		return
 	}
 
+	DPrintf("[%v] doing leave [%v]", sc.me, args.GIDs)
+
 	waitingCh := sc.createWaitingCh(commandIndex)
 
 	timer := time.NewTimer(getRetryTimeout())
@@ -188,6 +192,8 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 		return
 	}
 
+	DPrintf("[%v] doing move [%v --> %v]", sc.me, args.Shard, args.GID)
+
 	waitingCh := sc.createWaitingCh(commandIndex)
 
 	timer := time.NewTimer(getRetryTimeout())
@@ -238,7 +244,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 	}
 
 	opr := Op{
-		Method:   Leave,
+		Method:   Query,
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
 		Args:     []interface{}{args.Num},
@@ -250,6 +256,8 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 		reply.WrongLeader = true
 		return
 	}
+
+	DPrintf("[%v] doing query [%v]", sc.me, args.Num)
 
 	waitingCh := sc.createWaitingCh(commandIndex)
 
@@ -271,7 +279,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 		reply.Err = res.err
 		reply.WrongLeader = false
-		reply.Config = res.config
+		reply.Config = *res.config
 
 		return
 
@@ -322,10 +330,21 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.configs[0].Groups = map[int][]string{}
 
 	labgob.Register(Op{})
+	labgob.Register(map[int][]string{})
+
 	sc.applyCh = make(chan raft.ApplyMsg)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
+	sc.shardMap = make([]int, NShards)
+	for i := range sc.shardMap {
+		sc.shardMap[i] = 0
+	}
+	sc.replicaGroups = make(map[int][]string)
+	sc.replicaGroups[0] = []string{}
+
+	sc.duplicateTable = make(map[int64]int)
+	sc.waitingChPool = make(map[int]chan RequestResult)
 	sc.hashRing = NewHashRing(VirtualNodeNum)
 
 	go sc.applier()
@@ -353,7 +372,7 @@ func (sc *ShardCtrler) applier() {
 
 				res := sc.apply(opr)
 
-				DPrintf("[%v] success handler command [%v]", sc.me, applyMsg.CommandIndex)
+				DPrintf("[%v] success handle command [%v], method is [%v : %v]", sc.me, applyMsg.CommandIndex, opr.Method, opr.Args)
 
 				sc.lock("applier")
 				ch, ok := sc.waitingChPool[applyMsg.CommandIndex]
@@ -423,6 +442,7 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 				sc.hashRing.removeNode(GID)
 			}
 			sc.rehash()
+
 			sc.createNewConfig()
 		}
 
@@ -452,7 +472,7 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 			} else {
 				// todo: maybe no concurrent problem ? just append
 				// todo: if GC, need to lock
-				result.config = sc.configs[num]
+				result.config = &sc.configs[num]
 			}
 		}
 	}
@@ -467,9 +487,10 @@ func (sc *ShardCtrler) rehash() {
 		gid := sc.hashRing.getNode(i)
 		sc.shardMap[i] = gid
 	}
+	DPrintf("cur shardmap is [%v]", sc.shardMap)
 }
 
-func (sc *ShardCtrler) createNewConfig() Config {
+func (sc *ShardCtrler) createNewConfig() *Config {
 	//sc.lock("createNewConfig")
 	//defer sc.unlock("createNewConfig")
 
@@ -479,6 +500,9 @@ func (sc *ShardCtrler) createNewConfig() Config {
 	}
 	groups := make(map[int][]string)
 	for k, v := range sc.replicaGroups {
+		if k == 0 {
+			continue
+		}
 		groups[k] = append([]string{}, v...)
 	}
 
@@ -490,7 +514,7 @@ func (sc *ShardCtrler) createNewConfig() Config {
 
 	sc.configs = append(sc.configs, config)
 
-	return config
+	return &config
 }
 
 func (sc *ShardCtrler) lock(name string) {

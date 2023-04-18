@@ -22,6 +22,7 @@ type ShardCtrler struct {
 	duplicateTable map[int64]int              // clientId --> maxSeq
 	waitingChPool  map[int]chan RequestResult //
 	applierDoneCh  chan interface{}
+	hashRing       *HashRing // the hashRing that use for Consistent hash
 }
 
 type Op struct {
@@ -325,6 +326,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
+	sc.hashRing = NewHashRing(VirtualNodeNum)
 
 	go sc.applier()
 
@@ -398,8 +400,12 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 				group = append(group, servers...)
 
 				sc.replicaGroups[gid] = group
+
+				// add replica group into HashRing
+				sc.hashRing.addNode(gid)
 			}
 			sc.rehash()
+
 			// todo: make new Configuration
 			sc.createNewConfig()
 		}
@@ -412,6 +418,9 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 			// remove replica Groups in the GIDS
 			for _, GID := range GIDS {
 				delete(sc.replicaGroups, GID)
+
+				// remove replica group from HashRing
+				sc.hashRing.removeNode(GID)
 			}
 			sc.rehash()
 			sc.createNewConfig()
@@ -454,12 +463,15 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 
 // rehash the shards with Consistent Hash
 func (sc *ShardCtrler) rehash() {
-
+	for i := 0; i < NShards; i++ {
+		gid := sc.hashRing.getNode(i)
+		sc.shardMap[i] = gid
+	}
 }
 
 func (sc *ShardCtrler) createNewConfig() Config {
-	sc.lock("createNewConfig")
-	defer sc.unlock("createNewConfig")
+	//sc.lock("createNewConfig")
+	//defer sc.unlock("createNewConfig")
 
 	shards := [10]int{}
 	for i, v := range sc.shardMap {
@@ -467,7 +479,7 @@ func (sc *ShardCtrler) createNewConfig() Config {
 	}
 	groups := make(map[int][]string)
 	for k, v := range sc.replicaGroups {
-		groups[k] = v
+		groups[k] = append([]string{}, v...)
 	}
 
 	config := Config{

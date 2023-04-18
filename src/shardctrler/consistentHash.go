@@ -10,14 +10,14 @@ type HashRing struct {
 	Ring            []int         // logical Ring，store node's key sequentially
 	RealNodesMap    map[int]int   // virtualNode --> realNode
 	VirtualNodesMap map[int][]int // realNode --> virtualNode
-	ReplicaNum      int           // the number of virtualNode each real node
+	VirtualNodeNum  int           // the number of virtualNode each real node
 }
 
-func NewHashRing(replicaNum int) *HashRing {
+func NewHashRing(virtualNodeNum int) *HashRing {
 	return &HashRing{
-		Ring:         make([]int, 0),
-		RealNodesMap: make(map[int]int),
-		ReplicaNum:   replicaNum,
+		Ring:           make([]int, 0),
+		RealNodesMap:   make(map[int]int),
+		VirtualNodeNum: virtualNodeNum,
 	}
 }
 
@@ -28,7 +28,7 @@ func (hr *HashRing) addNode(node int) {
 	if !ok {
 		virtualNodes = make([]int, 0)
 	}
-	for i := 0; i < hr.ReplicaNum; i++ {
+	for i := 0; i < hr.VirtualNodeNum; i++ {
 		key := strconv.Itoa(i) + strconv.Itoa(node)
 		hash := int(crc32.ChecksumIEEE([]byte(key)))
 

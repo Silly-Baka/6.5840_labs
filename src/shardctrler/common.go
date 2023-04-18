@@ -44,6 +44,8 @@ const (
 	ErrWrongLeader = "wrongLeader"
 	ErrTimeOut     = "timeout"
 	Ok             = "ok"
+
+	VirtualNodeNum = 8
 )
 
 type Err string

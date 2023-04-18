@@ -15,9 +15,9 @@ type ShardCtrler struct {
 	rf      *raft.Raft
 	applyCh chan raft.ApplyMsg
 	// Your data here.
-	configs  []Config    // indexed by config num
-	shardMap map[int]int // shardId --> GID
+	configs []Config // indexed by config num
 
+	shardMap       []int                      // shardId --> GID
 	replicaGroups  map[int][]string           // GID --> names of replica in this group
 	duplicateTable map[int64]int              // clientId --> maxSeq
 	waitingChPool  map[int]chan RequestResult //
@@ -57,6 +57,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 
@@ -86,6 +87,7 @@ func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	case <-timer.C:
 		// timeout and retry
 		reply.Err = ErrTimeOut
+		reply.WrongLeader = false
 		timer.Stop()
 
 		go func() {
@@ -118,6 +120,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 
@@ -147,6 +150,7 @@ func (sc *ShardCtrler) Leave(args *LeaveArgs, reply *LeaveReply) {
 	case <-timer.C:
 		// timeout and retry
 		reply.Err = ErrTimeOut
+		reply.WrongLeader = false
 		timer.Stop()
 
 		go func() {
@@ -179,6 +183,7 @@ func (sc *ShardCtrler) Move(args *MoveArgs, reply *MoveReply) {
 
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 
@@ -241,6 +246,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 	if term != tmpTerm {
 		reply.Err = ErrWrongLeader
+		reply.WrongLeader = true
 		return
 	}
 
@@ -292,6 +298,9 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
 	// Your code here, if desired.
+
+	sc.applierDoneCh <- struct{}{}
+
 	DPrintf("[%v] shardctler was killed", sc.me)
 }
 
@@ -316,6 +325,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
+
+	go sc.applier()
 
 	return sc
 }
@@ -390,7 +401,7 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 			}
 			sc.rehash()
 			// todo: make new Configuration
-
+			sc.createNewConfig()
 		}
 
 	case Leave:
@@ -402,8 +413,8 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 			for _, GID := range GIDS {
 				delete(sc.replicaGroups, GID)
 			}
-			// todo: move the shard within dropped Groups
 			sc.rehash()
+			sc.createNewConfig()
 		}
 
 	case Move:
@@ -416,18 +427,22 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 			sc.shardMap[shard] = GID
 
 			// todo: make new configuration
-
+			sc.createNewConfig()
 		}
 	case Query:
 
 		num, _ := opr.Args[0].(int)
 		if opr.Seq > maxSeq {
+
+			//sc.lock("apply")
 			maxNum := len(sc.configs) - 1
+			//sc.unlock("apply")
 
 			if num == -1 || num > maxNum {
-				// todo: make new configuration and return
-
+				result.config = sc.createNewConfig()
 			} else {
+				// todo: maybe no concurrent problem ? just append
+				// todo: if GC, need to lock
 				result.config = sc.configs[num]
 			}
 		}
@@ -440,6 +455,30 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 // rehash the shards with Consistent Hash
 func (sc *ShardCtrler) rehash() {
 
+}
+
+func (sc *ShardCtrler) createNewConfig() Config {
+	sc.lock("createNewConfig")
+	defer sc.unlock("createNewConfig")
+
+	shards := [10]int{}
+	for i, v := range sc.shardMap {
+		shards[i] = v
+	}
+	groups := make(map[int][]string)
+	for k, v := range sc.replicaGroups {
+		groups[k] = v
+	}
+
+	config := Config{
+		Num:    len(sc.configs),
+		Shards: shards,
+		Groups: groups,
+	}
+
+	sc.configs = append(sc.configs, config)
+
+	return config
 }
 
 func (sc *ShardCtrler) lock(name string) {

@@ -3,6 +3,7 @@ package shardctrler
 import (
 	"6.5840/raft"
 	"math/rand"
+	"sort"
 	"time"
 )
 import "6.5840/labrpc"
@@ -22,7 +23,9 @@ type ShardCtrler struct {
 	duplicateTable map[int64]int              // clientId --> maxSeq
 	waitingChPool  map[int]chan RequestResult //
 	applierDoneCh  chan interface{}
-	hashRing       *HashRing // the hashRing that use for Consistent hash
+
+	hashRing       *HashRing     // the hashRing that use for Consistent hash
+	shardEachGroup map[int][]int // GID --> []shard
 }
 
 type Op struct {
@@ -346,6 +349,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.duplicateTable = make(map[int64]int)
 	sc.waitingChPool = make(map[int]chan RequestResult)
 	sc.hashRing = NewHashRing(VirtualNodeNum)
+	sc.shardEachGroup = make(map[int][]int)
 
 	go sc.applier()
 
@@ -419,9 +423,10 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 				group = append(group, servers...)
 
 				sc.replicaGroups[gid] = group
+				sc.shardEachGroup[gid] = make([]int, 0)
 
-				// add replica group into HashRing
-				sc.hashRing.addNode(gid)
+				//// add replica group into HashRing
+				//sc.hashRing.addNode(gid)
 			}
 			sc.rehash()
 
@@ -437,9 +442,10 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 			// remove replica Groups in the GIDS
 			for _, GID := range GIDS {
 				delete(sc.replicaGroups, GID)
+				delete(sc.shardEachGroup, GID)
 
-				// remove replica group from HashRing
-				sc.hashRing.removeNode(GID)
+				//// remove replica group from HashRing
+				//sc.hashRing.removeNode(GID)
 			}
 			sc.rehash()
 
@@ -452,8 +458,19 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 		GID, _ := opr.Args[1].(int)
 
 		if opr.Seq > maxSeq {
+			// remove the shard from origin Group
+			sds, ok := sc.shardEachGroup[sc.shardMap[shard]]
+			if ok {
+				for i, v := range sds {
+					if v == shard {
+						preArr := sds[:i]
+						sds = append(preArr, sds[i+1:]...)
+					}
+				}
+			}
 			// move the shard to GID
 			sc.shardMap[shard] = GID
+			sc.shardEachGroup[GID] = append(sc.shardEachGroup[GID], shard)
 
 			// todo: make new configuration
 			sc.createNewConfig()
@@ -482,12 +499,75 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 }
 
 // rehash the shards with Consistent Hash
+// use simpler algorithm because Consistent Hash could not pass the test
 func (sc *ShardCtrler) rehash() {
-	for i := 0; i < NShards; i++ {
-		gid := sc.hashRing.getNode(i)
-		sc.shardMap[i] = gid
+	//for i := 0; i < NShards; i++ {
+	//	gid := sc.hashRing.getNode(i)
+	//	sc.shardMap[i] = gid
+	//}
+	//DPrintf("cur shardmap is [%v]", sc.shardMap)
+
+	// cut the more, and add to the less
+	groupsNum := len(sc.replicaGroups)
+	div := NShards / groupsNum
+	mod := NShards % groupsNum
+
+	remainShards := make([]int, 0)
+
+	// sort
+	shardGroup := sc.mapToSlice(sc.shardEachGroup)
+	sort.Slice(shardGroup, func(i, j int) bool {
+		return len(shardGroup[i].Shards) >= len(shardGroup[j].Shards)
+	})
+
+	for _, pair := range shardGroup {
+		gid := pair.Gid
+		shards := pair.Shards
+
+		// cut the more
+		l := len(shards)
+		if l > div {
+			if l-div > 1 && mod > 0 {
+				// cut to div+1
+				mod--
+				remainShards = append(remainShards, shards[div+1:]...)
+				shards = shards[:div+1]
+
+				sc.shardEachGroup[gid] = shards
+			} else {
+				// cut to div
+				remainShards = append(remainShards, shards[div:]...)
+				shards = shards[:div]
+
+				sc.shardEachGroup[gid] = shards
+			}
+		} else {
+			// add to the less
+			dif := div - l
+			addShards := remainShards[:dif]
+			remainShards = remainShards[dif:]
+
+			for _, shard := range addShards {
+				sc.shardMap[shard] = gid
+			}
+			sc.shardEachGroup[gid] = append(sc.shardEachGroup[gid], addShards...)
+		}
 	}
-	DPrintf("cur shardmap is [%v]", sc.shardMap)
+}
+
+// KeyValue struct that store gid
+type GroupShardPair struct {
+	Gid    int
+	Shards []int
+}
+
+func (sc *ShardCtrler) mapToSlice(mapp map[int][]int) []GroupShardPair {
+	// 将 map 转换为 slice
+	var items []GroupShardPair
+	for k, v := range mapp {
+		items = append(items, GroupShardPair{k, v})
+	}
+	return items
 }
 
 func (sc *ShardCtrler) createNewConfig() *Config {

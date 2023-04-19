@@ -26,6 +26,7 @@ type ShardCtrler struct {
 
 	hashRing       *HashRing     // the hashRing that use for Consistent hash
 	shardEachGroup map[int][]int // GID --> []shard
+	remainShards   []int
 }
 
 type Op struct {
@@ -37,7 +38,7 @@ type Op struct {
 }
 
 type RequestResult struct {
-	config *Config
+	config Config
 	err    Err
 }
 
@@ -282,7 +283,7 @@ func (sc *ShardCtrler) Query(args *QueryArgs, reply *QueryReply) {
 
 		reply.Err = res.err
 		reply.WrongLeader = false
-		reply.Config = *res.config
+		reply.Config = res.config
 
 		return
 
@@ -350,6 +351,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.waitingChPool = make(map[int]chan RequestResult)
 	sc.hashRing = NewHashRing(VirtualNodeNum)
 	sc.shardEachGroup = make(map[int][]int)
+	sc.remainShards = []int{
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+	}
 
 	go sc.applier()
 
@@ -432,6 +436,8 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 
 			// todo: make new Configuration
 			sc.createNewConfig()
+
+			sc.duplicateTable[opr.ClientId] = opr.Seq
 		}
 
 	case Leave:
@@ -441,15 +447,25 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 
 			// remove replica Groups in the GIDS
 			for _, GID := range GIDS {
+				if GID > 500 {
+					DPrintf("blocking")
+				}
 				delete(sc.replicaGroups, GID)
-				delete(sc.shardEachGroup, GID)
 
-				//// remove replica group from HashRing
-				//sc.hashRing.removeNode(GID)
+				shards, ok := sc.shardEachGroup[GID]
+				if ok {
+					DPrintf("[%v] gid [%v] shard [%v] will be deleted", sc.me, GID, shards)
+					sc.remainShards = append(sc.remainShards, shards...)
+					for _, shard := range shards {
+						sc.shardMap[shard] = 0
+					}
+					delete(sc.shardEachGroup, GID)
+				}
 			}
 			sc.rehash()
 
 			sc.createNewConfig()
+			sc.duplicateTable[opr.ClientId] = opr.Seq
 		}
 
 	case Move:
@@ -459,14 +475,21 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 
 		if opr.Seq > maxSeq {
 			// remove the shard from origin Group
-			sds, ok := sc.shardEachGroup[sc.shardMap[shard]]
+			originGid := sc.shardMap[shard]
+			sds, ok := sc.shardEachGroup[originGid]
 			if ok {
+				l := len(sds)
 				for i, v := range sds {
 					if v == shard {
-						preArr := sds[:i]
-						sds = append(preArr, sds[i+1:]...)
+						// move the num after i to front
+						for j := i; j < l-1; j++ {
+							sds[j] = sds[j+1]
+						}
+						break
 					}
 				}
+				sds = append([]int{}, sds[:l-1]...)
+				sc.shardEachGroup[originGid] = sds
 			}
 			// move the shard to GID
 			sc.shardMap[shard] = GID
@@ -474,12 +497,13 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 
 			// todo: make new configuration
 			sc.createNewConfig()
+
+			sc.duplicateTable[opr.ClientId] = opr.Seq
 		}
 	case Query:
 
-		num, _ := opr.Args[0].(int)
 		if opr.Seq > maxSeq {
-
+			num, _ := opr.Args[0].(int)
 			//sc.lock("apply")
 			maxNum := len(sc.configs) - 1
 			//sc.unlock("apply")
@@ -489,8 +513,10 @@ func (sc *ShardCtrler) apply(opr Op) RequestResult {
 			} else {
 				// todo: maybe no concurrent problem ? just append
 				// todo: if GC, need to lock
-				result.config = &sc.configs[num]
+				result.config = sc.configs[num]
 			}
+
+			sc.duplicateTable[opr.ClientId] = opr.Seq
 		}
 	}
 	result.err = OK
@@ -508,11 +534,15 @@ func (sc *ShardCtrler) rehash() {
 	//DPrintf("cur shardmap is [%v]", sc.shardMap)
 
 	// cut the more, and add to the less
-	groupsNum := len(sc.replicaGroups)
+	groupsNum := len(sc.replicaGroups) - 1
+
+	DPrintf("[%v] rehashing, cur shards is [%v]", sc.me, sc.shardMap)
+	DPrintf("[%v] rehashing, cur groups is [%v]", sc.me, sc.replicaGroups)
+	if groupsNum == 0 {
+		return
+	}
 	div := NShards / groupsNum
 	mod := NShards % groupsNum
-
-	remainShards := make([]int, 0)
 
 	// sort
 	shardGroup := sc.mapToSlice(sc.shardEachGroup)
@@ -524,31 +554,46 @@ func (sc *ShardCtrler) rehash() {
 		gid := pair.Gid
 		shards := pair.Shards
 
+		if gid == 0 {
+			continue
+		}
+
 		// cut the more
 		l := len(shards)
 		if l > div {
 			if l-div > 1 && mod > 0 {
 				// cut to div+1
 				mod--
-				remainShards = append(remainShards, shards[div+1:]...)
+				sc.remainShards = append(sc.remainShards, shards[div+1:]...)
 				shards = shards[:div+1]
+				DPrintf("[%v] remainShards is [%v]", sc.me, sc.remainShards)
 
 				sc.shardEachGroup[gid] = shards
 			} else {
 				// cut to div
-				remainShards = append(remainShards, shards[div:]...)
+				sc.remainShards = append(sc.remainShards, shards[div:]...)
 				shards = shards[:div]
+				DPrintf("[%v] remainShards is [%v]", sc.me, sc.remainShards)
 
 				sc.shardEachGroup[gid] = shards
 			}
 		} else {
-			// add to the less
+			// add the less to div
 			dif := div - l
-			addShards := remainShards[:dif]
-			remainShards = remainShards[dif:]
+			if dif == 0 {
+				continue
+			}
+			addShards := sc.remainShards[:dif]
+			DPrintf("[%v] add shard [%v] to [%v]", sc.me, addShards, gid)
+
+			sc.remainShards = sc.remainShards[dif:]
+			DPrintf("[%v] remain shard is [%v]", sc.me, sc.remainShards)
 
 			for _, shard := range addShards {
 				sc.shardMap[shard] = gid
+			}
+			if gid == 504 {
+				DPrintf("666")
 			}
 			sc.shardEachGroup[gid] = append(sc.shardEachGroup[gid], addShards...)
 		}
@@ -570,7 +615,7 @@ func (sc *ShardCtrler) mapToSlice(mapp map[int][]int) []GroupShardPair {
 	return items
 }
 
-func (sc *ShardCtrler) createNewConfig() *Config {
+func (sc *ShardCtrler) createNewConfig() Config {
 	//sc.lock("createNewConfig")
 	//defer sc.unlock("createNewConfig")
 
@@ -594,7 +639,9 @@ func (sc *ShardCtrler) createNewConfig() *Config {
 
 	sc.configs = append(sc.configs, config)
 
-	return &config
+	DPrintf("[%v] new shards distribution is [%v]", sc.me, shards)
+
+	return config
 }
 
 func (sc *ShardCtrler) lock(name string) {

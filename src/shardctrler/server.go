@@ -570,7 +570,6 @@ func (sc *ShardCtrler) rehash() {
 		sc.shardEachGroup[minGid] = minShards
 		sc.shardEachGroup[maxGid] = maxShards
 	}
-
 	DPrintf("[%v] finished rehash", sc.me)
 }
 

@@ -38,6 +38,18 @@ type Clerk struct {
 	config   shardctrler.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+
+	requestCh  chan RequestFuture // the channel that maintain the order of requests from one client
+	lastLeader int
+	me         int64
+	seq        int // the sequence of request
+
+}
+
+type RequestFuture struct {
+	method     string
+	args       []string
+	responseCh chan interface{}
 }
 
 // the tester calls MakeClerk.
@@ -52,7 +64,58 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardctrler.MakeClerk(ctrlers)
 	ck.make_end = make_end
 	// You'll have to add code here.
+
+	ck.me = nrand()
+	ck.requestCh = make(chan RequestFuture)
+	ck.seq = 1
+
+	go ck.requestHandler()
+
 	return ck
+}
+
+// the goroutine that send and response request in order
+func (ck *Clerk) requestHandler() {
+	doneCh := make(chan interface{})
+	defer close(doneCh)
+
+	for {
+		select {
+		case future := <-ck.requestCh:
+			switch future.method {
+			case Get:
+				args := GetArgs{
+					Key:      future.args[0],
+					ClientId: ck.me,
+					Seq:      ck.seq,
+				}
+
+				// blocking and waiting for response
+				reply := ck.doGet(&args)
+
+				future.responseCh <- reply.Value
+			default:
+				// Put or Append
+				args := PutAppendArgs{
+					Key:      future.args[0],
+					Value:    future.args[1],
+					Op:       future.method,
+					ClientId: ck.me,
+					Seq:      ck.seq,
+				}
+
+				// blocking and waiting for response
+				reply := ck.doPutAppend(&args)
+
+				future.responseCh <- reply
+			}
+			// incr the seq
+			ck.seq++
+
+		case <-doneCh:
+			return
+		}
+	}
 }
 
 // fetch the current value for a key.
@@ -60,63 +123,115 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 // keeps trying forever in the face of all other errors.
 // You will have to modify this function.
 func (ck *Clerk) Get(key string) string {
-	args := GetArgs{}
-	args.Key = key
+
+	ch := make(chan interface{})
+
+	go func() {
+		ck.requestCh <- RequestFuture{
+			method:     Get,
+			args:       []string{key},
+			responseCh: ch,
+		}
+	}()
+	// waiting for resp
+	select {
+
+	case resp := <-ch:
+
+		v, ok := resp.(string)
+		if !ok {
+			DPrintf("get key [%v] response error", key)
+			return ""
+		}
+		return v
+	}
+}
+
+func (ck *Clerk) doGet(args *GetArgs) *GetReply {
+
+	key := args.Key
+	shard := key2shard(key)
 
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		// ask for the gid
 		if servers, ok := ck.config.Groups[gid]; ok {
-			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
-					return reply.Value
+			for _, svrName := range servers {
+				svr := ck.make_end(svrName)
+
+				reply := GetReply{}
+				if ok := svr.Call("ShardKV.Get", args, &reply); ok {
+					if reply.Err == OK || reply.Err == ErrNoKey {
+						return &reply
+					}
+					// not responsible for this key
+					if reply.Err == ErrWrongGroup {
+						break
+					}
+					// no reply or wrongLeader, continue
+					// todo: store the last leader of that group
+					// 	....
+					//  ....
 				}
-				if ok && (reply.Err == ErrWrongGroup) {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
+		// no gid Group or Wrong Group（have no shard）
+		// ask Controller for the latest Configuration
 		ck.config = ck.sm.Query(-1)
 	}
-
-	return ""
 }
 
 // shared by Put and Append.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	args := PutAppendArgs{}
-	args.Key = key
-	args.Value = value
-	args.Op = op
 
+	ch := make(chan interface{})
+
+	go func() {
+		ck.requestCh <- RequestFuture{
+			method:     op,
+			args:       []string{key, value},
+			responseCh: ch,
+		}
+	}()
+	// waiting for resp
+	select {
+	case <-ch:
+	}
+}
+
+func (ck *Clerk) doPutAppend(args *PutAppendArgs) *PutAppendReply {
+
+	key := args.Key
+	shard := key2shard(key)
 
 	for {
-		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
+		// ask for the gid
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
-				srv := ck.make_end(servers[si])
-				var reply PutAppendReply
-				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
-				if ok && reply.Err == OK {
-					return
+			for _, svrName := range servers {
+				svr := ck.make_end(svrName)
+
+				reply := PutAppendReply{}
+				if ok := svr.Call("ShardKV.PutAppend", args, &reply); ok {
+					if reply.Err == OK || reply.Err == ErrNoKey {
+						return &reply
+					}
+					// not responsible for this key
+					if reply.Err == ErrWrongGroup {
+						break
+					}
+					// no reply or wrongLeader, continue
+					// todo: store the last leader of that group
+					// 	....
+					//  ....
 				}
-				if ok && reply.Err == ErrWrongGroup {
-					break
-				}
-				// ... not ok, or ErrWrongLeader
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		// ask controler for the latest configuration.
+		// no gid Group or Wrong Group（have no shard）
+		// ask Controller for the latest Configuration
 		ck.config = ck.sm.Query(-1)
 	}
 }

@@ -22,20 +22,20 @@ const (
 	ErrWrongGroup     = "ErrWrongGroup"
 	ErrWrongLeader    = "ErrWrongLeader"
 	ErrTimeOut        = "timeout"
-	Get               = "get"
-	Put               = "put"
-	Append            = "append"
-	ConfigureInterval = 200 * time.Millisecond
+	GET               = "GET"
+	PUT               = "PUT"
+	APPEND            = "APPEND"
+	ConfigureInterval = 1000 * time.Millisecond
 )
 
 type Err string
 
-// Put or Append
+// PUT or APPEND
 type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	Key   string
 	Value string
-	Op    string // "Put" or "Append"
+	Op    string // "PUT" or "APPEND"
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.

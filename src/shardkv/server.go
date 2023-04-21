@@ -34,8 +34,8 @@ type ShardKV struct {
 	// 3A
 	DB            *DataBase
 	doneChPool    map[string]chan interface{}
-	DuplicateMap  map[int64]int              // map that record each client's last Seq
-	waitingChPool map[int]chan RequestResult // the map that record all the goroutines that waiting for command executed
+	DuplicateMap  map[int64]int               // map that record each client's last Seq
+	waitingChPool map[int]chan *RequestResult // the map that record all the goroutines that waiting for command executed
 
 	// 4B
 	config   *shardctrler.Config // the relative latest config from Shard Controller（maybe late）
@@ -49,6 +49,14 @@ type DataBase struct {
 type RequestResult struct {
 	value string
 	err   Err
+}
+
+func NewDataBase() *DataBase {
+	db := DataBase{}
+
+	db.Data = make(map[string]string)
+
+	return &db
 }
 
 func (db *DataBase) Get(key string) (string, Err) {
@@ -91,7 +99,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	shard := key2shard(args.Key)
 
 	// not responsible for this shard，do not resolve
-	if config.Shards[shard] != kv.me {
+	if config.Shards[shard] != kv.gid {
 		reply.Err = ErrWrongGroup
 		return
 	}
@@ -105,7 +113,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("[%v] server doing get [%v], client is [%v] seq is [%v]", kv.me, args.Key, args.ClientId, args.Seq)
 
 	opr := Op{
-		Method:   Get,
+		Method:   GET,
 		Args:     []string{args.Key},
 		ClientId: args.ClientId,
 		Seq:      args.Seq,
@@ -174,7 +182,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	shard := key2shard(args.Key)
 
 	// not responsible for this shard，do not resolve
-	if config.Shards[shard] != kv.me {
+	if config.Shards[shard] != kv.gid {
 		reply.Err = ErrWrongGroup
 		return
 	}
@@ -296,6 +304,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	// Use something like this to talk to the shardctrler:
 	// kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 
+	// 4B
 	kv.ctlerclk = shardctrler.MakeClerk(kv.ctrlers)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
@@ -304,8 +313,14 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.config = &shardctrler.Config{
 		Num: 0,
 	}
+	kv.doneChPool = make(map[string]chan interface{})
+	kv.waitingChPool = make(map[int]chan *RequestResult)
+	kv.DuplicateMap = make(map[int64]int)
+	kv.DB = NewDataBase()
+
 	// backup configurer that listen to the change of configuration
 	go kv.configurer()
+	go kv.applier()
 
 	return kv
 }
@@ -326,6 +341,7 @@ func (kv *ShardKV) configurer() {
 			config := kv.ctlerclk.Query(-1)
 			kv.config = &config
 
+			DPrintf("[%v] configurer get new configuration [%v]", kv.me, config)
 			kv.unlock("configurer")
 
 			timer.Reset(ConfigureInterval)
@@ -376,26 +392,26 @@ func (kv *ShardKV) applier() {
 }
 
 // the real logic of apply
-func (kv *ShardKV) apply(opr Op) RequestResult {
+func (kv *ShardKV) apply(opr Op) *RequestResult {
 	// check if outdated
 	maxSeq := kv.DuplicateMap[opr.ClientId]
 
 	result := RequestResult{}
 
 	switch opr.Method {
-	case Get:
+	case GET:
 		v, err := kv.DB.Get(opr.Args[0])
 		result.err = err
 		result.value = v
 
-	case Put:
+	case PUT:
 		if opr.Seq > maxSeq {
 			kv.DB.Put(opr.Args[0], opr.Args[1])
 			kv.DuplicateMap[opr.ClientId] = opr.Seq
 		}
 		result.err = OK
 
-	case Append:
+	case APPEND:
 		if opr.Seq > maxSeq {
 			kv.DB.Append(opr.Args[0], opr.Args[1])
 			kv.DuplicateMap[opr.ClientId] = opr.Seq
@@ -403,7 +419,7 @@ func (kv *ShardKV) apply(opr Op) RequestResult {
 		result.err = OK
 	}
 
-	return result
+	return &result
 }
 
 func (kv *ShardKV) getConfig() *shardctrler.Config {
@@ -413,11 +429,11 @@ func (kv *ShardKV) getConfig() *shardctrler.Config {
 	return kv.config
 }
 
-func (kv *ShardKV) createWaitingCh(commitIndex int) chan RequestResult {
+func (kv *ShardKV) createWaitingCh(commitIndex int) chan *RequestResult {
 	kv.lock("createWaitingCh")
 	defer kv.unlock("createWaitingCh")
 
-	ch := make(chan RequestResult)
+	ch := make(chan *RequestResult)
 	kv.waitingChPool[commitIndex] = ch
 
 	return ch

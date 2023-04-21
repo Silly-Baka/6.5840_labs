@@ -83,7 +83,7 @@ func (ck *Clerk) requestHandler() {
 		select {
 		case future := <-ck.requestCh:
 			switch future.method {
-			case Get:
+			case GET:
 				args := GetArgs{
 					Key:      future.args[0],
 					ClientId: ck.me,
@@ -95,7 +95,7 @@ func (ck *Clerk) requestHandler() {
 
 				future.responseCh <- reply.Value
 			default:
-				// Put or Append
+				// PUT or APPEND
 				args := PutAppendArgs{
 					Key:      future.args[0],
 					Value:    future.args[1],
@@ -128,7 +128,7 @@ func (ck *Clerk) Get(key string) string {
 
 	go func() {
 		ck.requestCh <- RequestFuture{
-			method:     Get,
+			method:     GET,
 			args:       []string{key},
 			responseCh: ch,
 		}
@@ -182,7 +182,7 @@ func (ck *Clerk) doGet(args *GetArgs) *GetReply {
 	}
 }
 
-// shared by Put and Append.
+// shared by PUT and APPEND.
 // You will have to modify this function.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 
@@ -215,7 +215,7 @@ func (ck *Clerk) doPutAppend(args *PutAppendArgs) *PutAppendReply {
 
 				reply := PutAppendReply{}
 				if ok := svr.Call("ShardKV.PutAppend", args, &reply); ok {
-					if reply.Err == OK || reply.Err == ErrNoKey {
+					if reply.Err == OK {
 						return &reply
 					}
 					// not responsible for this key
@@ -237,8 +237,8 @@ func (ck *Clerk) doPutAppend(args *PutAppendArgs) *PutAppendReply {
 }
 
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, "PUT")
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, "APPEND")
 }

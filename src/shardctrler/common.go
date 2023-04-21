@@ -32,7 +32,7 @@ type Config struct {
 
 const (
 	OK    = "OK"
-	Debug = true
+	Debug = false
 
 	// method name
 	Join  = "join"

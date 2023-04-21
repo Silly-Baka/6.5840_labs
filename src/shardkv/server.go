@@ -336,13 +336,16 @@ func (kv *ShardKV) configurer() {
 	for {
 		select {
 		case <-timer.C:
-			kv.lock("configurer")
 
 			config := kv.ctlerclk.Query(-1)
-			kv.config = &config
 
+			kv.mu.Lock()
+			if config.Num > kv.config.Num {
+				kv.config = &config
+			}
 			DPrintf("[%v] configurer get new configuration [%v]", kv.me, config)
-			kv.unlock("configurer")
+
+			kv.mu.Unlock()
 
 			timer.Reset(ConfigureInterval)
 

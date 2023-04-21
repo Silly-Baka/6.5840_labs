@@ -25,7 +25,7 @@ const (
 	GET               = "GET"
 	PUT               = "PUT"
 	APPEND            = "APPEND"
-	ConfigureInterval = 1000 * time.Millisecond
+	ConfigureInterval = 100 * time.Millisecond
 )
 
 type Err string

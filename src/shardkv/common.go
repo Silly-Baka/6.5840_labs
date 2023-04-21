@@ -1,6 +1,9 @@
 package shardkv
 
-import "log"
+import (
+	"log"
+	"time"
+)
 
 //
 // Sharded key/value server.
@@ -12,13 +15,17 @@ import "log"
 //
 
 const (
-	Debug          = true
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
-	Get            = "get"
-	PutAppend      = "putappend"
+	Debug = true
+
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongLeader    = "ErrWrongLeader"
+	ErrTimeOut        = "timeout"
+	Get               = "get"
+	Put               = "put"
+	Append            = "append"
+	ConfigureInterval = 200 * time.Millisecond
 )
 
 type Err string
